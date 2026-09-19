@@ -216,23 +216,45 @@ func (s *schemaSet) field(doc *jsonSchema, dir string, seen []string, depth int)
 		out.Children[name] = child
 	}
 
+	settleShape(out, doc)
+
+	return out
+}
+
+// settleShape decides what an object turned out to be, once its children are
+// known.
+//
+// An object with no keys of its own is two different things, and only one of
+// them is a mapping. With additionalProperties it is a map of arbitrary keys:
+// free-form, but still a mapping, so it keeps the type and stays worth
+// checking.
+//
+// Without, it states nothing at all. That is what upstream's config schema
+// renders a Go `any` as, and the resource processor's attributes[].value is one
+// -- it takes a plain string. Typing that as a map made the linter demand a
+// mapping and report `value: "log"`, which is how the processor is ordinarily
+// used, as an error. So it is left unconstrained, which is what the empty type
+// already means everywhere else: nothing is known, so nothing is checked.
+//
+// Either way the keys under it stay open, or a map whose children were never
+// expanded -- from a cycle, or a module publishing no schema -- has every key
+// below it read as unknown.
+func settleShape(out *schema.Field, doc *jsonSchema) {
 	if len(out.Children) > 0 && out.Type == "" {
 		out.Type = typeMap
 	}
 
-	// A map that accepts arbitrary keys must not have them reported as unknown.
 	if doc.AdditionalProperties != nil {
 		out.Open = true
 	}
 
-	// A map whose keys were not expanded, because of a cycle or a reference
-	// into something not published, has to stay open or every key under it
-	// reads as unknown.
 	if out.Type == typeMap && len(out.Children) == 0 {
 		out.Open = true
-	}
 
-	return out
+		if doc.AdditionalProperties == nil {
+			out.Type = ""
+		}
+	}
 }
 
 // merge folds a referenced or composed schema into the one referring to it.
@@ -395,6 +417,44 @@ func attachFields(cat *schema.Schema, set *schemaSet) int {
 	return n
 }
 
+// settleOpenness decides whether the secondary closes a mapping the primary
+// left open.
+//
+// A published schema states a component's sections outright, the ones the Go
+// sources can only decode by hand included, so where it describes a section no
+// tag names it is the better answer about whether that mapping is closed. But
+// only where it does. Upstream derives these files from the same mapstructure
+// tags, so a component that reads a section by hand is missing it from both:
+// hostmetrics has published a schema since v0.145.0 that lists root_path and
+// metadata_collection_interval and says nothing of scrapers until v0.154.0.
+// Closing on that puts the false positive back, and puts it back for exactly
+// the releases people are still running.
+//
+// So a secondary settles openness only where it says something the primary did
+// not already know. A key the sources never resolved is the evidence that this
+// schema describes more than the tags do; one that lists only keys they did
+// resolve has not looked into the hand-read section either, and the open
+// mapping stands.
+func settleOpenness(primary, secondary *schema.Field) {
+	if secondary.Open {
+		primary.Open = true
+
+		return
+	}
+
+	if !primary.Open || len(secondary.Children) == 0 {
+		return
+	}
+
+	for name := range secondary.Children {
+		if _, known := primary.Children[name]; !known {
+			primary.Open = false
+
+			return
+		}
+	}
+}
+
 // enrich adds to a field schema without ever taking away from it. The primary
 // states the shape; the secondary contributes what it knows and nothing else,
 // because a key dropped here becomes a false report against a valid config.
@@ -411,9 +471,7 @@ func enrich(primary, secondary *schema.Field) {
 		primary.ExtensionRef = secondary.ExtensionRef
 	}
 
-	if secondary.Open {
-		primary.Open = true
-	}
+	settleOpenness(primary, secondary)
 
 	for name, child := range secondary.Children {
 		if primary.Children == nil {
