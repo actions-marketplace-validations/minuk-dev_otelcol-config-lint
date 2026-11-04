@@ -31,6 +31,121 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  http-schema-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+      - name: Generate and check HTTP schemas from pinned upstream releases
+        run: go test -race -tags=integration ./pkg/cmd/schemagen -run '^TestHTTPReleaseSchemas$' -count=1 -v -timeout=12m
+
+  cli-smoke:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: otelcol-config-lint
+          - os: macos-15
+            binary: otelcol-config-lint
+          - os: windows-latest
+            binary: otelcol-config-lint.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.25
+      - name: Build the CLI
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w" -o "${{ runner.temp }}/${{ matrix.binary }}" ./cmd/otelcol-config-lint
+      - name: Exercise native paths, settings discovery, output and exit codes
+        env:
+          OTELCOL_LINT_BINARY: ${{ runner.temp }}/${{ matrix.binary }}
+        run: go test -tags=integration ./test/smoke -count=1 -v
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzConfigParse, FuzzSettingsParse, FuzzSchemaRead, FuzzLint]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.25
+      - name: Run bounded fuzz smoke test
+        run: >-
+          go test ./pkg/lint -run '^$' -fuzz '^${{ matrix.target }}$'
+          -fuzztime=15s -fuzzminimizetime=5s -parallel=2 -timeout=2m
+      - name: Retain failing corpus
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: pkg/lint/testdata/fuzz/
+          if-no-files-found: ignore
+
+  collector-compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [0.110.0, 0.157.0]
+        distribution: [core, contrib]
+        include:
+          - distribution: core
+            binary: otelcol
+          - distribution: contrib
+            binary: otelcol-contrib
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.25
+      - name: Download and verify the pinned Collector
+        env:
+          VERSION: ${{ matrix.version }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          cd "$RUNNER_TEMP"
+          archive="${BINARY}_${VERSION}_linux_amd64.tar.gz"
+          release="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${VERSION}"
+          curl --fail --location --retry 3 "$release/$archive" --output "$archive"
+          curl --fail --location --retry 3 \
+            "$release/opentelemetry-collector-releases_${BINARY}_checksums.txt" --output checksums.txt
+          grep " ${archive}$" checksums.txt | sha256sum --check -
+          tar -xzf "$archive" "$BINARY"
+      - name: Compare lint results with Collector validation
+        env:
+          OTELCOL_BINARY: ${{ runner.temp }}/${{ matrix.binary }}
+          OTELCOL_VERSION: v${{ matrix.version }}
+          OTELCOL_DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          go test -race -tags=integration ./pkg/cmd/otelcol-config-lint \
+            -run CollectorCompatibility -count=1 -v 2>&1 | tee "$RUNNER_TEMP/collector-compatibility.log"
+      - name: Retain compatibility results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: collector-compatibility-${{ matrix.distribution }}-${{ matrix.version }}
+          path: ${{ runner.temp }}/collector-compatibility.log
+
   schemas:
     # The schemas are generated, so a hand edit that does not match what
     # schemagen produces would silently change what every config is checked

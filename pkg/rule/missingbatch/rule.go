@@ -38,14 +38,26 @@ import (
 // setting the release would accept.
 func New() rule.Rule {
 	return missingBatch{rule.NewBase("missing-batch",
-		"exporting without batching costs throughput and export requests", diag.Info)}
+		"exporting without batching costs throughput and export requests", diag.Info), nil}
 }
 
-type missingBatch struct{ rule.Base }
+type missingBatch struct {
+	rule.Base
+
+	additionalProcessors []string
+}
 
 func (r missingBatch) Check(ctx *rule.Context) {
 	for _, p := range ctx.File.Service.Pipelines {
-		if rule.HasProcessorType(p, rule.BatchType) || len(p.Exporters) == 0 {
+		if rule.IsExpansion(p.ProcessorsNode) {
+			continue
+		}
+
+		if r.hasBatchProcessor(p) || rule.HasDynamicRefs(p.Processors) || len(p.Exporters) == 0 {
+			continue
+		}
+
+		if ctx.Index.UpstreamCovered(p, r.processorTypes(), []string{"forward"}) {
 			continue
 		}
 

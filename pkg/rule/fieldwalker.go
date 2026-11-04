@@ -7,13 +7,17 @@ import (
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // The schema types a field can declare. Only maps and lists are descended
 // into; the rest are leaves.
 const (
-	typeMap  = "map"
-	typeList = "list"
+	typeMap   = "map"
+	typeList  = "list"
+	typeInt   = "int"
+	typeFloat = "float"
+	typeBool  = "bool"
 )
 
 // FieldWalker validates a component's settings against its field schema. Each
@@ -35,6 +39,8 @@ type FieldWalker struct {
 	// OnDeprecated is called for a key upstream has replaced, with the note
 	// saying what replaces it.
 	OnDeprecated func(key string, node *yaml.Node, path, note string)
+	// OnSkipped reports missing or open field schemas, independently of findings.
+	OnSkipped func(path, reason string)
 }
 
 // WalkComponents validates every declared component that has a field schema.
@@ -52,12 +58,16 @@ func (w FieldWalker) WalkComponents() {
 		}
 
 		for _, c := range sec.Components {
+			path := kind.Section() + "." + c.ID.String()
+
 			comp, ok := w.Ctx.Schema.Lookup(kind, c.ID.Type)
 			if !ok || comp.Fields == nil {
+				w.skipped(path, "missing_schema")
+
 				continue
 			}
 
-			w.walk(comp.Fields, c.ValueNode, kind.Section()+"."+c.ID.String())
+			w.walk(comp.Fields, c.ValueNode, path)
 		}
 	}
 }
@@ -74,6 +84,11 @@ func (w FieldWalker) walk(field *schema.Field, node *yaml.Node, path string) {
 	node = ResolveAlias(node)
 	if node == nil || node.Kind == yaml.AliasNode {
 		return
+	}
+
+	if field.Open || (field.Type == "" && len(field.Children) == 0) ||
+		(field.Type == typeMap && len(field.Children) == 0) {
+		w.skipped(path, "open_schema")
 	}
 
 	if IsNull(node) {
@@ -102,10 +117,10 @@ func (w FieldWalker) walkMap(field *schema.Field, node *yaml.Node, path string) 
 		return
 	}
 
-	present := map[string]bool{}
+	present := sets.New[string]()
 
 	for _, e := range MapEntries(node, path) {
-		present[e.Key] = true
+		present.Insert(e.Key)
 
 		child, known := field.Children[e.Key]
 
@@ -133,6 +148,8 @@ func (w FieldWalker) walkList(field *schema.Field, node *yaml.Node, path string)
 
 	item := field.Children["item"]
 	if item == nil {
+		w.skipped(path, "missing_schema")
+
 		return
 	}
 
@@ -141,13 +158,13 @@ func (w FieldWalker) walkList(field *schema.Field, node *yaml.Node, path string)
 	}
 }
 
-func (w FieldWalker) checkRequired(field *schema.Field, present map[string]bool, node *yaml.Node, path string) {
+func (w FieldWalker) checkRequired(field *schema.Field, present sets.Set[string], node *yaml.Node, path string) {
 	if w.OnRequired == nil {
 		return
 	}
 
 	for _, req := range field.Required {
-		if !present[req] {
+		if !present.Has(req) {
 			w.OnRequired(req, node, JoinPath(path, req))
 		}
 	}
@@ -163,7 +180,13 @@ func (w FieldWalker) checkType(field *schema.Field, node *yaml.Node, path string
 		return false // resolved at runtime by a confmap provider
 	}
 
-	if ok := matchesType(field, node); !ok {
+	if w.unknownScalar(field, node) {
+		w.skipped(path, "unknown_decoder")
+
+		return false
+	}
+
+	if ok := matchesType(field, w.Ctx.DecodeScalar(node, field.Type)); !ok {
 		if w.OnInvalid != nil {
 			w.OnInvalid(node, path, describeType(field))
 		}
@@ -211,15 +234,16 @@ func matchesType(field *schema.Field, node *yaml.Node) bool {
 	case typeList:
 		return node.Kind == yaml.SequenceNode
 	case "string":
-		return node.Kind == yaml.ScalarNode
-	case "bool":
+		return node.Kind == yaml.ScalarNode && node.Tag == strTag
+	case typeBool:
 		return node.Tag == BoolTag
-	case "int":
-		return node.Tag == "!!int"
-	case "float":
-		return node.Tag == "!!float" || node.Tag == "!!int"
+	case typeInt:
+		// shortcut: float integers must fit int64; model field widths before allowing overflow conversions.
+		return node.Tag == intTag || (node.Tag == floatTag && ReadInt(node).Known)
+	case typeFloat:
+		return node.Tag == floatTag || node.Tag == intTag
 	case "duration":
-		return node.Kind == yaml.ScalarNode && durationRE.MatchString(node.Value)
+		return ReadDuration(node).Known
 	default:
 		return true
 	}
@@ -236,4 +260,24 @@ func describeType(field *schema.Field) string {
 	default:
 		return "a " + field.Type
 	}
+}
+
+func (w FieldWalker) skipped(path, reason string) {
+	if w.OnSkipped != nil {
+		w.OnSkipped(path, reason)
+	}
+}
+
+func (w FieldWalker) unknownScalar(field *schema.Field, node *yaml.Node) bool {
+	if w.Ctx == nil || node.Tag != strTag {
+		return false
+	}
+
+	if field.Type != typeInt && field.Type != typeFloat && field.Type != typeBool {
+		return false
+	}
+
+	_, _, known := w.Ctx.Schema.ScalarDecoding()
+
+	return !known && matchesType(field, decodeQuotedScalar(node, field.Type))
 }

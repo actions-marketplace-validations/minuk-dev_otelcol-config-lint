@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
@@ -15,6 +21,11 @@ import (
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/lint"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/rule"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/hardcodedsecret"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/ruletest"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/servicerequired"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/ruleset"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
 )
 
@@ -71,6 +82,25 @@ func newLinter(t *testing.T, opts lint.Options) *lint.Linter {
 	return lint.New(opts)
 }
 
+func TestAliasedComponentKey(t *testing.T) {
+	t.Parallel()
+
+	const source = `receivers:
+  &component otlp:
+    protocols:
+      grpc: {endpoint: localhost:4317}
+exporters:
+  *component : {endpoint: backend:4317}
+service:
+  pipelines:
+    traces: {receivers: [otlp], exporters: [otlp]}
+`
+
+	result := newLinter(t, lint.Options{MinSeverity: diag.Error}).Lint(t.Context(), "alias.yaml", []byte(source))
+	assert.Equal(t, lint.Valid, result.Status)
+	assert.Empty(t, result.Diagnostics)
+}
+
 func TestStatuses(t *testing.T) {
 	t.Parallel()
 
@@ -89,6 +119,45 @@ func TestStatuses(t *testing.T) {
 	}
 }
 
+func TestEmptySchemaKeepsStructuralChecks(t *testing.T) {
+	t.Parallel()
+
+	const src = `receivers:
+  imaginaryreceiver: {}
+service:
+  pipelines:
+    traces:
+      receivers: [imaginaryreceiver]
+`
+
+	for name, input := range map[string]string{
+		"nil schema":      "",
+		"empty object":    `{}`,
+		"null":            `null`,
+		"empty inventory": `{"components":{"receiver":{},"exporter":{}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var cat *schema.Schema
+
+			if input != "" {
+				var err error
+
+				cat, err = schema.Read(strings.NewReader(input))
+				require.NoError(t, err)
+				require.NotNil(t, cat)
+				assert.Zero(t, cat.Count())
+			}
+
+			result := lint.New(lint.Options{Schema: cat, MinSeverity: diag.Error}).Lint(t.Context(), "config.yaml", []byte(src))
+			require.Equal(t, lint.Invalid, result.Status)
+			require.Len(t, result.Diagnostics, 1)
+			assert.Equal(t, "empty-pipeline", result.Diagnostics[0].Rule)
+		})
+	}
+}
+
 func TestSyntaxErrorIsADiagnosticNotAFailure(t *testing.T) {
 	t.Parallel()
 
@@ -102,6 +171,223 @@ func TestSyntaxErrorIsADiagnosticNotAFailure(t *testing.T) {
 	if len(r.Diagnostics) != 1 || r.Diagnostics[0].Rule != "yaml-syntax" {
 		t.Errorf("want a yaml-syntax diagnostic, got %+v", r.Diagnostics)
 	}
+}
+
+func TestCyclicAliasesAreInvalid(t *testing.T) {
+	t.Parallel()
+
+	const childEnv = "OTELCOL_TEST_CYCLIC_ALIAS"
+	if os.Getenv(childEnv) != "1" {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+
+		//nolint:gosec // re-executes this test binary with a fixed test filter
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCyclicAliasesAreInvalid$")
+
+		cmd.Env = append(os.Environ(), childEnv+"=1")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", out)
+
+		return
+	}
+
+	// Bound a regression's stack overflow to this subprocess.
+	debug.SetMaxStack(256 * 1024)
+
+	l := newLinter(t, lint.Options{})
+
+	for _, value := range []string{"nested: *loop", "nested: [*loop]", "<<: *loop"} {
+		result := l.Lint(t.Context(), "cycle.yaml", []byte("exporters:\n  otlp: &loop\n    "+value+"\n"))
+		require.Equal(t, lint.Invalid, result.Status)
+		require.Len(t, result.Diagnostics, 1)
+		assert.Equal(t, "yaml-syntax", result.Diagnostics[0].Rule)
+		assert.Contains(t, result.Diagnostics[0].Message, "cyclic YAML alias")
+		assert.Equal(t, 3, result.Diagnostics[0].Position.Line)
+	}
+}
+
+func TestAliasAmplificationIsInvalid(t *testing.T) {
+	t.Parallel()
+
+	const childEnv = "OTELCOL_TEST_ALIAS_AMPLIFICATION"
+	if os.Getenv(childEnv) != "1" {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		t.Cleanup(cancel)
+
+		//nolint:gosec // re-executes this test binary with a fixed test filter
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAliasAmplificationIsInvalid$")
+
+		cmd.Env = append(os.Environ(), childEnv+"=1")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", out)
+
+		return
+	}
+
+	src, err := os.ReadFile("../../testdata/aliases/amplification.yaml")
+	require.NoError(t, err)
+
+	start := bytes.Index(src, []byte("    nest6:"))
+	end := bytes.Index(src, []byte("\nextensions:"))
+
+	require.Positive(t, start)
+	require.Greater(t, end, start)
+	bounded := strings.Replace(string(src[:start])+string(src[end:]), "value: x", "token: abc123def456", 1)
+
+	for name, rules := range map[string][]rule.Rule{
+		"all rules":        nil,
+		"hardcoded-secret": {hardcodedsecret.New()},
+		"no rules":         {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			l := newLinter(t, lint.Options{Rules: rules})
+			result := l.Lint(t.Context(), "amplification.yaml", src)
+			require.Equal(t, lint.Invalid, result.Status)
+			require.Len(t, result.Diagnostics, 1)
+			assert.Equal(t, "yaml-syntax", result.Diagnostics[0].Rule)
+			assert.Contains(t, result.Diagnostics[0].Message, "YAML expansion limit of 100000 nodes")
+			assert.Positive(t, result.Diagnostics[0].Position.Line)
+			assert.Positive(t, result.Diagnostics[0].Position.Column)
+
+			// A smaller shared graph must still reach the index and rule walkers.
+			result = l.Lint(t.Context(), "bounded.yaml", []byte(bounded))
+
+			secrets := 0
+
+			for _, d := range result.Diagnostics {
+				assert.NotEqual(t, "yaml-syntax", d.Rule)
+
+				if d.Rule == "hardcoded-secret" {
+					secrets++
+				}
+			}
+
+			if name == "no rules" {
+				assert.Equal(t, lint.Valid, result.Status)
+				assert.Zero(t, secrets)
+			} else {
+				assert.Equal(t, 1, secrets)
+			}
+		})
+	}
+}
+
+func TestEmbeddedConfigMapsReportOuterPositions(t *testing.T) {
+	t.Parallel()
+
+	src := `apiVersion: apps/v1
+kind: Deployment
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent
+data:
+  notes: |
+    service: documentation
+  collector.yaml: |
+    receivers:
+      otlp:
+    service:
+      pipelines:
+        traces:
+          receivers: [missing]
+          exporters: [debug]
+---
+kind: ConfigMap
+metadata:
+  name: gateway
+data:
+  config: |2
+      exporters:
+        debug:
+      service:
+        pipelines:
+          traces:
+            receivers: [missing]
+            exporters: [debug]
+`
+	l := newLinter(t, lint.Options{Embedded: true, MinSeverity: diag.Error})
+	r := l.Lint(t.Context(), "manifest.yaml", []byte(src))
+	require.Equal(t, lint.Invalid, r.Status)
+
+	var positions []diag.Position
+
+	for _, d := range r.Diagnostics {
+		if d.Rule == "undefined-reference" && strings.Contains(d.Message, "receiver \"missing\"") {
+			positions = append(positions, d.Position)
+			if d.Position.Line == 17 {
+				assert.Contains(t, d.Message, "agent/collector.yaml")
+			} else {
+				assert.Contains(t, d.Message, "gateway/config")
+			}
+		}
+	}
+
+	assert.Equal(t, []diag.Position{
+		{File: "manifest.yaml", Line: 17, Column: 23},
+		{File: "manifest.yaml", Line: 30, Column: 25},
+	}, positions)
+
+	var out bytes.Buffer
+
+	f, err := lint.NewFormatter("github", &out, lint.FormatterOptions{})
+	require.NoError(t, err)
+	require.NoError(t, f.Result(r))
+	require.NoError(t, f.Finish(lint.Summary{}))
+	assert.Contains(t, out.String(), "file=manifest.yaml,line=17,col=23")
+	assert.Contains(t, out.String(), "agent/collector.yaml")
+}
+
+func TestEmbeddedConfigMapReportsInnerSyntaxError(t *testing.T) {
+	t.Parallel()
+
+	src := "kind: ConfigMap\nmetadata:\n  name: agent\ndata:\n  config: |\n    receivers:\n      otlp: [\n"
+	r := newLinter(t, lint.Options{Embedded: true}).Lint(t.Context(), "manifest.yaml", []byte(src))
+	require.Equal(t, lint.Invalid, r.Status)
+	require.NotEmpty(t, r.Diagnostics)
+	assert.Equal(t, "yaml-syntax", r.Diagnostics[0].Rule)
+	assert.Equal(t, "manifest.yaml", r.Diagnostics[0].Position.File)
+	assert.GreaterOrEqual(t, r.Diagnostics[0].Position.Line, 6)
+	assert.Contains(t, r.Diagnostics[0].Message, "agent/config")
+}
+
+func TestEmbeddedConfigMapReportsMissingService(t *testing.T) {
+	t.Parallel()
+
+	src := "kind: ConfigMap\ndata:\n  config: |\n    receivers:\n      otlp:\n"
+	r := newLinter(t, lint.Options{Embedded: true}).Lint(t.Context(), "manifest.yaml", []byte(src))
+	require.Equal(t, lint.Invalid, r.Status)
+
+	for _, d := range r.Diagnostics {
+		if d.Rule == "service-required" {
+			assert.Equal(t, diag.Position{File: "manifest.yaml", Line: 4, Column: 5}, d.Position)
+
+			return
+		}
+	}
+
+	t.Fatal("missing service-required finding")
+}
+
+func TestEmbeddedConfigMapReportsEmptyPipeline(t *testing.T) {
+	t.Parallel()
+
+	src := "kind: ConfigMap\ndata:\n  config: |\n    service:\n      pipelines:\n        traces: {}\n"
+	r := newLinter(t, lint.Options{Embedded: true}).Lint(t.Context(), "manifest.yaml", []byte(src))
+	require.Equal(t, lint.Invalid, r.Status)
+
+	assert.Condition(t, func() bool {
+		for _, d := range r.Diagnostics {
+			if d.Rule == "empty-pipeline" && d.Position.File == "manifest.yaml" {
+				return true
+			}
+		}
+
+		return false
+	})
 }
 
 func TestMinSeverityFilters(t *testing.T) {
@@ -134,6 +420,12 @@ func TestFailOnRaisesTheGate(t *testing.T) {
 	if r := strictly.Lint(t.Context(), "x.yaml", []byte(src)); r.Status != lint.Invalid {
 		t.Error("-fail-on warning should fail")
 	}
+
+	hidden := newLinter(t, lint.Options{FailOn: diag.Warning, MinSeverity: diag.Error}).Lint(
+		t.Context(), "x.yaml", []byte(src))
+	if hidden.Status != lint.Invalid || len(hidden.Diagnostics) != 0 {
+		t.Errorf("hidden warnings must still fail the gate: %+v", hidden)
+	}
 }
 
 func TestDisabledRule(t *testing.T) {
@@ -163,32 +455,238 @@ func TestIgnoreMissingSchemasSilencesUnknownComponents(t *testing.T) {
 	}
 }
 
-func TestLintAllVisitsEveryFile(t *testing.T) {
+func TestLintAllPreservesInputOrder(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
+	for _, workers := range []int{-1, 0, 1, 3, 100} {
+		t.Run(strconv.Itoa(workers), func(t *testing.T) {
+			t.Parallel()
 
-	names := []string{"a.yaml", "b.yaml", "c.yaml", "d.yaml"}
-	paths := make([]string, 0, len(names))
+			synctest.Test(t, func(t *testing.T) {
+				fsys := afero.NewMemMapFs()
+				require.NoError(t, afero.WriteFile(fsys, "slow.yaml", []byte(good), 0o600))
+				require.NoError(t, afero.WriteFile(fsys, "bad.yaml", []byte(bad), 0o600))
+				require.NoError(t, afero.WriteFile(fsys, "syntax.yaml", []byte("receivers: ["), 0o600))
+				l := newLinter(t, lint.Options{Fs: fsys, Environment: func(path string) rule.Environment {
+					if path == "slow.yaml" {
+						time.Sleep(time.Second)
+					}
 
-	for _, name := range names {
-		p := filepath.Join(dir, name)
+					return rule.Environment{}
+				}})
+				paths := []string{"slow.yaml", "missing.yaml", "bad.yaml", "slow.yaml", "syntax.yaml"}
+				want := []lint.Status{lint.Valid, lint.Error, lint.Invalid, lint.Valid, lint.Invalid}
 
-		err := os.WriteFile(p, []byte(good), 0o600)
-		if err != nil {
-			t.Fatal(err)
-		}
+				results, err := l.LintAll(t.Context(), paths, workers)
+				require.NoError(t, err)
+				require.Len(t, results, len(paths))
 
-		paths = append(paths, p)
+				for i, result := range results {
+					assert.Equal(t, paths[i], result.Path)
+					assert.Equal(t, want[i], result.Status)
+				}
+
+				require.ErrorIs(t, results[1].Err, os.ErrNotExist)
+			})
+		})
+	}
+}
+
+func TestLintAllEmptyInput(t *testing.T) {
+	t.Parallel()
+
+	l := lint.New(lint.Options{})
+
+	for _, workers := range []int{-1, 0, 1, 100} {
+		t.Run(strconv.Itoa(workers), func(t *testing.T) {
+			t.Parallel()
+
+			results, err := l.LintAll(t.Context(), nil, workers)
+			require.NoError(t, err)
+			assert.Nil(t, results)
+		})
+	}
+}
+
+type callbackRule struct {
+	rule.Base
+
+	check func()
+}
+
+func (r callbackRule) Check(_ *rule.Context) { r.check() }
+
+type watchedFS struct {
+	afero.Fs
+
+	opens atomic.Int64
+}
+
+func (f *watchedFS) Open(name string) (afero.File, error) {
+	f.opens.Add(1)
+
+	return f.Fs.Open(name)
+}
+
+func TestPreCancelledLintDoesNoWork(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	fsys := &watchedFS{Fs: afero.NewMemMapFs(), opens: atomic.Int64{}}
+	l := lint.New(lint.Options{Fs: fsys})
+
+	reader := strings.NewReader(good)
+	for name, result := range map[string]lint.Result{
+		"file":     l.LintFile(ctx, "agent.yaml"),
+		"reader":   l.LintReader(ctx, "stdin", reader),
+		"source":   l.Lint(ctx, "agent.yaml", []byte(good)),
+		"embedded": lint.New(lint.Options{Embedded: true}).Lint(ctx, "manifest.yaml", nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, lint.Error, result.Status)
+			require.ErrorIs(t, result.Err, context.Canceled)
+		})
 	}
 
-	seen := map[string]bool{}
-	for r := range newLinter(t, lint.Options{}).LintAll(t.Context(), paths, 3) {
-		seen[r.Path] = true
+	assert.Zero(t, fsys.opens.Load())
+	assert.Equal(t, len(good), reader.Len())
+
+	for name, paths := range map[string][]string{"files": {"a.yaml", "b.yaml"}, "empty": nil} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			results, err := l.LintAll(ctx, paths, 2)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Nil(t, results)
+			assert.Zero(t, fsys.opens.Load())
+		})
 	}
 
-	if len(seen) != len(paths) {
-		t.Errorf("want %d results, got %d", len(paths), len(seen))
+	assert.Zero(t, fsys.opens.Load())
+}
+
+func TestLintAllCancellationStopsWorkers(t *testing.T) {
+	t.Parallel()
+
+	for _, workers := range []int{1, 3} {
+		t.Run(strconv.Itoa(workers), func(t *testing.T) {
+			t.Parallel()
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				entered := make(chan struct{}, workers)
+				release := make(chan struct{})
+				fsys := &watchedFS{Fs: afero.NewMemMapFs(), opens: atomic.Int64{}}
+				require.NoError(t, afero.WriteFile(fsys, "agent.yaml", []byte(good), 0o600))
+				l := lint.New(lint.Options{Fs: fsys, Rules: []rule.Rule{
+					callbackRule{Base: rule.NewBase("wait", "", diag.Error), check: func() {
+						entered <- struct{}{}
+
+						<-release
+					}},
+					callbackRule{Base: rule.NewBase("later", "", diag.Error), check: func() {
+						t.Error("a later rule ran after cancellation")
+					}},
+				}})
+
+				paths := make([]string, workers+10)
+				for i := range paths {
+					paths[i] = "agent.yaml"
+				}
+
+				done := make(chan struct{})
+
+				go func() {
+					defer close(done)
+
+					results, err := l.LintAll(ctx, paths, workers)
+					assert.ErrorIs(t, err, context.Canceled)
+					assert.Nil(t, results)
+				}()
+
+				for range workers {
+					<-entered
+				}
+
+				cancel()
+				synctest.Wait()
+
+				select {
+				case <-done:
+					t.Fatal("LintAll returned before its workers finished")
+				default:
+				}
+
+				close(release)
+				<-done
+
+				assert.EqualValues(t, workers, fsys.opens.Load())
+			})
+		})
+	}
+}
+
+func TestLintAllCancellationInLastRuleCannotPass(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	fsys := afero.NewMemMapFs()
+	require.NoError(t, afero.WriteFile(fsys, "agent.yaml", []byte(good), 0o600))
+
+	calls := 0
+	l := lint.New(lint.Options{Fs: fsys, Rules: []rule.Rule{
+		callbackRule{Base: rule.NewBase("cancel", "", diag.Error), check: func() {
+			calls++
+
+			if calls == 2 {
+				cancel()
+			}
+		}},
+	}})
+
+	results, err := l.LintAll(ctx, []string{"agent.yaml", "agent.yaml"}, 1)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, results)
+	assert.Equal(t, 2, calls)
+}
+
+func TestCancellationInLastRuleCannotPass(t *testing.T) {
+	t.Parallel()
+
+	for _, embedded := range []bool{false, true} {
+		t.Run(strconv.FormatBool(embedded), func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			calls := 0
+			l := lint.New(lint.Options{Embedded: embedded, Rules: []rule.Rule{
+				callbackRule{Base: rule.NewBase("cancel", "", diag.Error), check: func() {
+					calls++
+
+					cancel()
+				}},
+			}})
+
+			src := "service: {}"
+			if embedded {
+				src = "kind: ConfigMap\ndata:\n  first: |\n    service:\n      pipelines: {}\n" +
+					"  second: |\n    service:\n      pipelines: {}\n---\nkind: ConfigMap\ndata:\n" +
+					"  third: |\n    service:\n      pipelines: {}\n"
+			}
+
+			result := l.Lint(ctx, "agent.yaml", []byte(src))
+			assert.Equal(t, lint.Error, result.Status)
+			require.ErrorIs(t, result.Err, context.Canceled)
+			assert.Equal(t, 1, calls)
+		})
 	}
 }
 
@@ -359,24 +857,77 @@ func TestVersionIndexFindsRemovedComponents(t *testing.T) {
 	}
 }
 
-// TestAMissingCheckIntervalIsReportedOnce pins that memory-limiter-config
-// stands down where the field schema already marks check_interval required:
-// one missing key, one finding, not two about the same line.
-func TestAMissingCheckIntervalIsReportedOnce(t *testing.T) {
+func TestMemoryLimiterMissingIntervalRuleSelection(t *testing.T) {
 	t.Parallel()
 
-	src := strings.Replace(good, "    check_interval: 1s\n", "", 1)
-
-	var about []string
-
-	for _, d := range newLinter(t, lint.Options{}).Lint(t.Context(), "x.yaml", []byte(src)).Diagnostics {
-		if strings.Contains(d.Message, "check_interval") {
-			about = append(about, d.Rule)
-		}
+	tests := []struct {
+		name      string
+		selection ruleset.Selection
+		wantRules []string
+	}{
+		{
+			name: "memory-limiter-config alone",
+			selection: ruleset.Selection{
+				Default: ruleset.DefaultNone, Enable: []string{"memory-limiter-config"},
+			},
+			wantRules: []string{"memory-limiter-config"},
+		},
+		{
+			name: "required-field enabled",
+			selection: ruleset.Selection{
+				Default: ruleset.DefaultNone, Enable: []string{"memory-limiter-config", "required-field"},
+			},
+			wantRules: []string{"memory-limiter-config", "required-field"},
+		},
+		{
+			name:      "required-field disabled",
+			selection: ruleset.Selection{Disable: []string{"required-field"}},
+			wantRules: []string{"memory-limiter-config"},
+		},
+		{
+			name:      "required-field explicitly off",
+			selection: ruleset.Selection{Severity: []string{"required-field=off"}},
+			wantRules: []string{"memory-limiter-config"},
+		},
+		{
+			name:      "all rules report both diagnostics",
+			selection: ruleset.Selection{},
+			wantRules: []string{"memory-limiter-config", "required-field"},
+		},
 	}
 
-	if len(about) != 1 {
-		t.Errorf("want one finding about check_interval, got %v", about)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sch := ruletest.Schema()
+			sch.Components[config.KindProcessor]["memory_limiter"].Fields = &schema.Field{
+				Type: "map", Required: []string{"check_interval"},
+				Children: map[string]*schema.Field{
+					"check_interval":  {Type: "duration"},
+					"limit_mib":       {Type: "int"},
+					"spike_limit_mib": {Type: "int"},
+				},
+			}
+			resolved, err := ruleset.Resolve(tt.selection)
+			require.NoError(t, err)
+
+			linter := lint.New(lint.Options{Schema: sch, Rules: resolved.Rules, Severities: resolved.Severities})
+			src := strings.Replace(ruletest.Clean, "    check_interval: 1s\n", "", 1)
+			result := linter.Lint(t.Context(), "config.yaml", []byte(src))
+			require.NoError(t, result.Err)
+			assert.Equal(t, lint.Invalid, result.Status)
+
+			var gotRules []string
+
+			for _, d := range result.Diagnostics {
+				gotRules = append(gotRules, d.Rule)
+				assert.Equal(t, "processors.memory_limiter.check_interval", d.Path)
+				assert.Equal(t, diag.Error, d.Severity)
+			}
+
+			assert.ElementsMatch(t, tt.wantRules, gotRules)
+		})
 	}
 }
 
@@ -426,4 +977,25 @@ func TestFormattersCarryTheDocumentationLink(t *testing.T) {
 			t.Errorf("%s output drops the link:\n%s", name, buf.String())
 		}
 	}
+}
+
+func TestNewOwnsRuleSliceAndSeverities(t *testing.T) {
+	t.Parallel()
+
+	rules := []rule.Rule{servicerequired.New()}
+	severities := map[string]diag.Severity{"service-required": diag.Warning}
+	linter := lint.New(lint.Options{
+		Rules: rules, Severities: severities, IgnoreMissingSchemas: true,
+	})
+	assert.NotContains(t, severities, "unknown-component", "New must not modify caller policy")
+
+	rules[0] = nil
+	severities["service-required"] = diag.Off
+	returned := linter.Rules()
+	returned[0] = nil
+
+	result := linter.Lint(t.Context(), "request.yaml", []byte("{}"))
+	require.Len(t, result.Diagnostics, 1)
+	assert.Equal(t, "service-required", result.Diagnostics[0].Rule)
+	assert.Equal(t, diag.Warning, result.Diagnostics[0].Severity)
 }

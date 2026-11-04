@@ -1,13 +1,19 @@
 package rule
 
 import (
+	"math"
 	"strconv"
 	"time"
 
-	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
+)
+
+const (
+	strTag   = "!!str"
+	intTag   = "!!int"
+	floatTag = "!!float"
 )
 
 // Setting is one value read out of a component's settings block, for the rules
@@ -33,32 +39,56 @@ func Absent() Setting { return Setting{Node: nil, Present: false, Known: false, 
 // reads it: confmap unmarshals through yaml.v3, which resolves 0x400 as 1024,
 // 8_192 as 8192, and a leading zero as octal, so 0100 is 64 and not a hundred.
 // Reading base 10 here would compare, and quote back, a number the collector
-// never sees.
+// never sees. Fractional numbers truncate toward zero. Null is a known zero,
+// matching the Collector's scalar decoder.
 //
 // A value nothing can know before the collector starts -- an expansion, or text
 // of the wrong type -- is present but not known, which stops every check that
 // would need the number.
 func ReadInt(node *yaml.Node) Setting {
-	out := Setting{Node: node, Present: true, Known: false, Num: 0}
-	if node == nil || node.Kind != yaml.ScalarNode || HasExpansion(node.Value) {
+	if node == nil {
+		return Absent()
+	}
+
+	out := Setting{Node: node, Present: true, Known: IsNull(node), Num: 0}
+	if out.Known || node.Kind != yaml.ScalarNode || HasExpansion(node.Value) {
 		return out
 	}
 
-	num, err := strconv.ParseInt(node.Value, 0, 64)
-	if err != nil {
-		return out
-	}
+	switch node.Tag {
+	case intTag:
+		out.Known = node.Decode(&out.Num) == nil
 
-	out.Known, out.Num = true, num
+	case floatTag:
+		var num float64
+
+		// The upper bound is exclusive: float64 rounds MaxInt64 up to 2^63.
+		err := node.Decode(&num)
+		if err == nil && num >= math.MinInt64 && num < math.MaxInt64 {
+			out.Known, out.Num = true, int64(num)
+		}
+
+	default:
+		// Other scalar types are not numbers.
+	}
 
 	return out
 }
 
 // ReadDuration reads a duration setting, holding it in nanoseconds.
+// Numbers are nanoseconds (fractional values truncate), and null is a known zero.
 func ReadDuration(node *yaml.Node) Setting {
-	out := Setting{Node: node, Present: true, Known: false, Num: 0}
-	if node == nil || node.Kind != yaml.ScalarNode || HasExpansion(node.Value) {
+	if node == nil {
+		return Absent()
+	}
+
+	out := Setting{Node: node, Present: true, Known: IsNull(node), Num: 0}
+	if out.Known || node.Kind != yaml.ScalarNode || HasExpansion(node.Value) {
 		return out
+	}
+
+	if node.Tag == intTag || node.Tag == floatTag {
+		return ReadInt(node)
 	}
 
 	dur, err := time.ParseDuration(node.Value)
@@ -78,8 +108,8 @@ func (s Setting) Positive() bool { return s.Known && s.Num > 0 }
 // here, so no check that needs the number can run.
 func (s Setting) Unknown() bool { return s.Present && !s.Known }
 
-// ProcessorsOfType returns every declared processor of one type, read into
-// whatever the caller needs. Matching on the type rather than the whole id is
+// ProcessorsOfType reads processors of one type whose settings are not provider expansions.
+// Matching on the type rather than the whole id is
 // what covers named instances such as "batch/traces".
 func ProcessorsOfType[T any](f *config.File, typ string, read func(config.Component) T) []T {
 	sec := f.Sections[config.KindProcessor]
@@ -87,7 +117,46 @@ func ProcessorsOfType[T any](f *config.File, typ string, read func(config.Compon
 		return nil
 	}
 
-	declared := lo.Filter(sec.Components, func(c config.Component, _ int) bool { return c.ID.Type == typ })
+	var out []T
 
-	return lo.Map(declared, func(c config.Component, _ int) T { return read(c) })
+	for _, c := range sec.Components {
+		if c.ID.Type == typ && !IsExpansion(c.ValueNode) {
+			out = append(out, read(c))
+		}
+	}
+
+	return out
+}
+
+// InvalidUint32 reports values a known uint32 field cannot decode, including signed strings.
+func (s Setting) InvalidUint32() bool {
+	if !s.Known {
+		return false
+	}
+
+	if s.Num < 0 || s.Num > math.MaxUint32 {
+		return true
+	}
+
+	if s.Node == nil {
+		return false
+	}
+
+	switch s.Node.Tag {
+	case strTag:
+		value := s.Node.Value
+		if value == "" {
+			value = "0"
+		}
+
+		_, err := strconv.ParseUint(value, 0, 32)
+
+		return err != nil
+	case floatTag:
+		var num float64
+
+		return s.Node.Decode(&num) == nil && num < 0
+	default:
+		return false
+	}
 }

@@ -4,12 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/spf13/afero"
+
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // The modes new directories and files are created with.
@@ -30,7 +32,7 @@ func (o *options) writeFile(cat *schema.Schema, formats []schema.Format) error {
 		return writeTo(o.out, cat, formatFor(o.outFile, formats))
 	}
 
-	err := write(o.outFile, cat, formatFor(o.outFile, formats))
+	err := o.write(o.outFile, cat, formatFor(o.outFile, formats))
 	if err != nil {
 		return err
 	}
@@ -54,17 +56,26 @@ func formatFor(path string, formats []schema.Format) schema.Format {
 // "<registry>/<distribution>/<version>.<format>", which is the layout the
 // registry is read back in.
 func (o *options) writeRegistry(cat *schema.Schema, formats []schema.Format) error {
-	dir := filepath.Join(o.registryDir, cat.Distribution)
-
-	err := os.MkdirAll(dir, dirPerm)
+	err := validateDestination(cat.Distribution, cat.CollectorVersion)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
+		return err
+	}
+
+	root, closeRoot, err := o.createRoot(o.registryDir)
+	if err != nil {
+		return fmt.Errorf("open registry: %w", err)
+	}
+	defer closeRoot()
+
+	err = root.MkdirAll(cat.Distribution, dirPerm)
+	if err != nil {
+		return fmt.Errorf("create distribution directory: %w", err)
 	}
 
 	for _, format := range formats {
-		dest := filepath.Join(dir, cat.CollectorVersion+"."+string(format))
+		dest := filepath.Join(cat.Distribution, cat.CollectorVersion+"."+string(format))
 
-		err := write(dest, cat, format)
+		err := o.writeDoc(o.registryDir, dest, func(w io.Writer) error { return cat.Write(w, format) })
 		if err != nil {
 			return err
 		}
@@ -80,7 +91,7 @@ func (o *options) writeRegistry(cat *schema.Schema, formats []schema.Format) err
 // the registry directory, not from the manifests generated in this run, so
 // regenerating one distribution leaves the others listed.
 func (o *options) writeIndex() (*schema.Index, error) {
-	entries, err := os.ReadDir(o.registryDir)
+	entries, err := afero.ReadDir(o.fs(), o.registryDir)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", o.registryDir, err)
 	}
@@ -94,7 +105,7 @@ func (o *options) writeIndex() (*schema.Index, error) {
 
 		dir := filepath.Join(o.registryDir, e.Name())
 
-		versions := versionsIn(dir)
+		versions := o.versionsIn(dir)
 		if len(versions) == 0 {
 			// Not a distribution, just a directory that happens to sit here.
 			continue
@@ -102,7 +113,7 @@ func (o *options) writeIndex() (*schema.Index, error) {
 
 		idx.Distributions[e.Name()] = versions
 
-		ext := extensionIn(dir, versions)
+		ext := o.extensionIn(dir, versions)
 		if ext != "" {
 			idx.Extensions[e.Name()] = ext
 		}
@@ -110,7 +121,7 @@ func (o *options) writeIndex() (*schema.Index, error) {
 
 	dest := filepath.Join(o.registryDir, schema.IndexFile)
 
-	err = writeDoc(dest, idx.Write)
+	err = o.writeDoc(o.registryDir, schema.IndexFile, idx.Write)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +161,7 @@ func (o *options) writeComponents(idx *schema.Index) error {
 
 	dest := filepath.Join(o.registryDir, schema.ComponentsFile)
 
-	err := writeDoc(dest, comps.Write)
+	err := o.writeDoc(o.registryDir, schema.ComponentsFile, comps.Write)
 	if err != nil {
 		return err
 	}
@@ -164,10 +175,10 @@ func (o *options) writeComponents(idx *schema.Index) error {
 // type, by reading every schema the registry holds for it.
 func (o *options) spansIn(dist string, versions []string) (schema.ComponentSpans, error) {
 	// kind -> type -> the releases shipping it.
-	present := map[config.Kind]map[string]map[string]bool{}
+	present := map[config.Kind]map[string]sets.Set[string]{}
 
 	for _, v := range versions {
-		cat, err := readRegistrySchema(filepath.Join(o.registryDir, dist), v)
+		cat, err := o.readRegistrySchema(filepath.Join(o.registryDir, dist), v)
 		if err != nil {
 			return nil, err
 		}
@@ -175,16 +186,16 @@ func (o *options) spansIn(dist string, versions []string) (schema.ComponentSpans
 		for kind, byType := range cat.Components {
 			byName, ok := present[kind]
 			if !ok {
-				byName = map[string]map[string]bool{}
+				byName = map[string]sets.Set[string]{}
 				present[kind] = byName
 			}
 
 			for typ := range byType {
 				if byName[typ] == nil {
-					byName[typ] = map[string]bool{}
+					byName[typ] = sets.New[string]()
 				}
 
-				byName[typ][v] = true
+				byName[typ].Insert(v)
 			}
 		}
 	}
@@ -206,7 +217,7 @@ func (o *options) spansIn(dist string, versions []string) (schema.ComponentSpans
 // whichever form it was published in. JSON comes first here, unlike everywhere
 // else: this reads the whole registry rather than one file, and the two forms
 // hold the same schema.
-func readRegistrySchema(dir, version string) (*schema.Schema, error) {
+func (o *options) readRegistrySchema(dir, version string) (*schema.Schema, error) {
 	exts := []string{".json"}
 
 	for _, ext := range schema.Extensions() {
@@ -218,12 +229,12 @@ func readRegistrySchema(dir, version string) (*schema.Schema, error) {
 	for _, ext := range exts {
 		path := filepath.Join(dir, version+ext)
 
-		_, err := os.Stat(path)
+		_, err := o.fs().Stat(path)
 		if err != nil {
 			continue
 		}
 
-		return schema.ReadFile(path)
+		return schema.ReadFileFS(o.fs(), path)
 	}
 
 	return nil, fmt.Errorf("%w: %s", errNoSchemaFile, filepath.Join(dir, version))
@@ -235,8 +246,14 @@ var errNoSchemaFile = errors.New("no schema file")
 
 // writeDoc writes one of the documents published beside the schemas, replacing
 // whatever was there before.
-func writeDoc(dest string, encode func(io.Writer) error) error {
-	f, err := os.Create(dest)
+func (o *options) writeDoc(dir, dest string, encode func(io.Writer) error) error {
+	root, closeRoot, err := o.openRoot(dir)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", dir, err)
+	}
+	defer closeRoot()
+
+	f, err := root.Create(dest)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dest, err)
 	}
@@ -259,14 +276,14 @@ func writeDoc(dest string, encode func(io.Writer) error) error {
 // ones as YAML -- have no single answer, and an index naming one of them would
 // send half the fetches at a file that is not there. Those record nothing, and
 // are probed as before.
-func extensionIn(dir string, versions []string) string {
+func (o *options) extensionIn(dir string, versions []string) string {
 	answer := ""
 
 	for _, v := range versions {
 		found := ""
 
 		for _, ext := range schema.Extensions() {
-			_, err := os.Stat(filepath.Join(dir, v+ext))
+			_, err := o.fs().Stat(filepath.Join(dir, v+ext))
 			if err == nil {
 				found = ext
 
@@ -286,17 +303,17 @@ func extensionIn(dir string, versions []string) string {
 
 // versionsIn lists the releases a distribution directory holds, in any of the
 // formats a schema may be written in.
-func versionsIn(dir string) []string {
-	seen := map[string]bool{}
+func (o *options) versionsIn(dir string) []string {
+	seen := sets.New[string]()
 
 	var out []string
 
 	for _, ext := range schema.Extensions() {
-		names, _ := filepath.Glob(filepath.Join(dir, "*"+ext))
+		names, _ := afero.Glob(o.fs(), filepath.Join(dir, "*"+ext))
 		for _, n := range names {
 			v := strings.TrimSuffix(filepath.Base(n), ext)
-			if !seen[v] {
-				seen[v] = true
+			if !seen.Has(v) {
+				seen.Insert(v)
 				out = append(out, v)
 			}
 		}
@@ -306,8 +323,8 @@ func versionsIn(dir string) []string {
 }
 
 // write serialises a schema to disk, replacing whatever was there before.
-func write(dest string, cat *schema.Schema, format schema.Format) error {
-	f, err := os.Create(dest)
+func (o *options) write(dest string, cat *schema.Schema, format schema.Format) error {
+	f, err := o.fs().Create(dest)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dest, err)
 	}

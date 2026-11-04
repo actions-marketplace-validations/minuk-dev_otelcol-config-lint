@@ -6,15 +6,20 @@ import (
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/rule"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // New builds the rule.
 func New() rule.Rule {
-	return componentStability{rule.NewBase("component-stability",
-		"components below beta stability can change or break without notice", diag.Info)}
+	return componentStability{Base: rule.NewBase("component-stability",
+		"components below beta stability can change or break without notice", diag.Info), reportAlpha: true}
 }
 
-type componentStability struct{ rule.Base }
+type componentStability struct {
+	rule.Base
+
+	reportAlpha bool
+}
 
 func (r componentStability) Check(ctx *rule.Context) {
 	if !ctx.SchemaReady() {
@@ -46,6 +51,10 @@ func (r componentStability) report(ctx *rule.Context, c config.Component, comp *
 				Severity: diag.Warning,
 			})
 		case schema.Alpha:
+			if !r.reportAlpha {
+				continue
+			}
+
 			ctx.Report(rule.Finding{
 				Node: c.KeyNode, Path: path,
 				Message: subject + " is alpha; its configuration can change between releases",
@@ -53,6 +62,7 @@ func (r componentStability) report(ctx *rule.Context, c config.Component, comp *
 		default:
 			// Beta and above are what a config should be built on, and
 			// deprecated-component covers the other end.
+			continue
 		}
 
 		return // one finding per component is enough
@@ -69,13 +79,13 @@ func usedSignals(ctx *rule.Context, c config.Component) []config.Signal {
 
 	var out []config.Signal
 
-	seen := map[config.Signal]bool{}
+	seen := sets.New[config.Signal]()
 
 	for _, p := range ctx.File.Service.Pipelines {
 		for _, slot := range []config.Kind{config.KindReceiver, config.KindProcessor, config.KindExporter} {
 			for _, ref := range p.Refs(slot) {
-				if ref.ID == c.ID && !seen[p.Signal] {
-					seen[p.Signal] = true
+				if ref.ID == c.ID && !seen.Has(p.Signal) {
+					seen.Insert(p.Signal)
 					out = append(out, p.Signal)
 				}
 			}

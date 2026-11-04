@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // Releases before v0.150.0 predate the config.schema.yaml files upstream now
@@ -56,19 +57,19 @@ type goIndex struct {
 	// underlying kind says nothing about what a config writes: an int with an
 	// UnmarshalText method is spelled as a word, the way the debug exporter's
 	// verbosity is "detailed" and not 2.
-	textual map[string]bool
+	textual sets.Set[string]
 	// selfDecoding holds the types that decode themselves from a confmap.
 	// Their mapstructure tags are not the whole of what they accept: a setting
 	// the method reads by hand is a setting no tag names.
-	selfDecoding map[string]bool
+	selfDecoding sets.Set[string]
 	fset         *token.FileSet
 }
 
 func newGoIndex() *goIndex {
 	return &goIndex{
 		byName:       map[string]*goType{},
-		textual:      map[string]bool{},
-		selfDecoding: map[string]bool{},
+		textual:      sets.New[string](),
+		selfDecoding: sets.New[string](),
 		fset:         token.NewFileSet(),
 	}
 }
@@ -131,11 +132,11 @@ func (g *goIndex) addMethod(importPath string, imports map[string]string, method
 	}
 
 	switch method.Name.Name {
-	case "UnmarshalText", "UnmarshalYAML", "UnmarshalJSON":
-		g.textual[importPath+"."+name] = true
+	case "UnmarshalText":
+		g.textual.Insert(importPath + "." + name)
 	case "Unmarshal":
 		if takesConfmap(method, imports) {
-			g.selfDecoding[importPath+"."+name] = true
+			g.selfDecoding.Insert(importPath + "." + name)
 		}
 	}
 }
@@ -201,7 +202,7 @@ func (g *goIndex) fields(key string, seen []string, depth int) *schema.Field {
 	unfilled := false
 
 	for _, f := range decl.strukt.Fields.List {
-		if !g.addStructField(out, decl, f, append(seen, key), depth) {
+		if !g.addStructField(out, decl, f, append(seen, key), depth) && !httpBookkeeping(declaredAt, f) {
 			unfilled = true
 		}
 	}
@@ -211,7 +212,7 @@ func (g *goIndex) fields(key string, seen []string, depth int) *schema.Field {
 	}
 
 	// A squashed struct may already have opened this one; see mergeChildren.
-	out.Open = out.Open || (unfilled && g.selfDecoding[declaredAt])
+	out.Open = out.Open || (unfilled && g.selfDecoding.Has(declaredAt))
 
 	return out
 }
@@ -289,6 +290,7 @@ func (g *goIndex) field(decl *goType, expr ast.Expr, doc string, seen []string, 
 				out.Open = true
 			} else {
 				out.Children = nested.Children
+				out.Open = nested.Open
 			}
 		}
 	}
@@ -314,7 +316,7 @@ func (g *goIndex) scalar(decl *goType, expr ast.Expr) string {
 	}
 
 	key := g.resolve(decl, expr)
-	if g.textual[key] {
+	if g.textual.Has(key) {
 		return typeString
 	}
 
@@ -527,4 +529,37 @@ func attachSourceFields(cat *schema.Schema, index *goIndex) int {
 	}
 
 	return n
+}
+
+// httpBookkeeping recognizes only the non-config fields audited against Collector
+// confighttp v0.160.0 (cd3455cf3a7f672208140b1ebb1581c542b2b0ed). HTTP Unmarshal migrates tagged
+// keepalive keys; these fields store warnings or prevent unkeyed literals.
+// Additional unfilled fields must still leave the decoder open.
+func httpBookkeeping(key string, field *ast.Field) bool {
+	if key != coreModuleRoot+"/config/confighttp.ClientConfig" &&
+		key != coreModuleRoot+"/config/confighttp.ServerConfig" {
+		return false
+	}
+
+	if len(field.Names) != 1 || field.Tag != nil {
+		return false
+	}
+
+	switch field.Names[0].Name {
+	case "_":
+		typ, ok := field.Type.(*ast.StructType)
+
+		return ok && len(typ.Fields.List) == 0
+	case "deprecationWarnings":
+		typ, ok := field.Type.(*ast.ArrayType)
+		if !ok || typ.Len != nil {
+			return false
+		}
+
+		item, ok := typ.Elt.(*ast.Ident)
+
+		return ok && item.Name == typeString
+	default:
+		return false
+	}
 }

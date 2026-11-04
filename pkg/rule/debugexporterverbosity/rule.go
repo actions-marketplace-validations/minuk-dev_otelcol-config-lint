@@ -62,7 +62,16 @@ func (r debugExporterVerbosity) Check(ctx *rule.Context) {
 				continue
 			}
 
-			ctx.Report(r.finding(p, ref, detailedDebug(c)))
+			finding := r.finding(p, ref, detailedDebug(c))
+			if detailedDebug(c) && sampledDebug(ctx, c) {
+				finding.Severity = diag.Info
+				finding.Message = "exporter " + rule.Quote(ref.ID.String()) +
+					" emits sampled detailed telemetry in pipeline " + rule.Quote(p.Key)
+				finding.Hint = "sampling reduces output frequency but still emits detailed payloads; " +
+					"remove the exporter when diagnosis is complete"
+			}
+
+			ctx.Report(finding)
 		}
 	}
 }
@@ -91,7 +100,7 @@ func (r debugExporterVerbosity) finding(p config.Pipeline, ref config.Ref, detai
 		Message: "exporter " + rule.Quote(ref.ID.String()) + " runs at " + verbosityKey + ": " + detailedLevel +
 			" in pipeline " + rule.Quote(p.Key) + ", logging every record it receives",
 		Hint: "set " + verbosityKey + ": basic, or remove the exporter from " + exporters + "; " +
-			"sampling_initial and sampling_thereafter bound the rate if it has to stay at " + detailedLevel,
+			"sampling_initial and sampling_thereafter can reduce output frequency if it stays at " + detailedLevel,
 		Docs: rule.DebugDocs,
 	}
 }
@@ -105,7 +114,7 @@ func (r debugExporterVerbosity) finding(p config.Pipeline, ref config.Ref, detai
 // is true of a debug exporter at any verbosity; a warning quoting a verbosity
 // nobody wrote would not be.
 func detailedDebug(c config.Component) bool {
-	val, written := rule.ChildNode(c.ValueNode, verbosityKey).Get()
+	val, written := rule.ChildNode(c.ValueNode, verbosityKey)
 	if !written {
 		return false
 	}
@@ -116,4 +125,21 @@ func detailedDebug(c config.Component) bool {
 	}
 
 	return strings.EqualFold(val.Value, detailedLevel)
+}
+
+// sampledDebug only accepts explicit known sampling that reduces output.
+// Thereafter=1 logs every message; unknown/default values are not evidence.
+func sampledDebug(ctx *rule.Context, c config.Component) bool {
+	initialNode, _ := rule.ChildNode(c.ValueNode, "sampling_initial")
+	thereafterNode, _ := rule.ChildNode(c.ValueNode, "sampling_thereafter")
+
+	initialNode, thereafterNode = rule.ResolveAlias(initialNode), rule.ResolveAlias(thereafterNode)
+	if initialNode == nil || thereafterNode == nil || rule.IsNull(initialNode) || rule.IsNull(thereafterNode) {
+		return false
+	}
+
+	initial := ctx.ReadInt(initialNode)
+	thereafter := ctx.ReadInt(thereafterNode)
+
+	return initial.Known && initial.Num >= 0 && thereafter.Known && thereafter.Num > 1
 }

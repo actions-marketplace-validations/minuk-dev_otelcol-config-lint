@@ -7,10 +7,8 @@
 package memorylimiterconfig
 
 import (
-	"slices"
 	"time"
 
-	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/rule"
 )
@@ -36,8 +34,13 @@ func New() rule.Rule {
 type memoryLimiterConfig struct{ rule.Base }
 
 func (r memoryLimiterConfig) Check(ctx *rule.Context) {
-	for _, lim := range rule.MemoryLimiters(ctx.File) {
+	for _, lim := range ctx.MemoryLimiters() {
 		r.checkInterval(ctx, lim)
+
+		if r.checkRange(ctx, lim) {
+			continue
+		}
+
 		r.checkLimits(ctx, lim)
 		r.checkSpikes(ctx, lim)
 	}
@@ -51,13 +54,6 @@ func (r memoryLimiterConfig) checkInterval(ctx *rule.Context, lim rule.MemoryLim
 
 	switch {
 	case !lim.CheckInterval.Present:
-		// The field schema marks check_interval required on every release that
-		// describes the component, and required-field reports it there. Saying
-		// it twice about one line helps nobody.
-		if schemaRequires(ctx, rule.MemoryLimiterType, "check_interval") {
-			return
-		}
-
 		ctx.Report(rule.Finding{
 			Node: lim.Node, Path: path,
 			Message: lim.Name() + " has no check_interval, and its default of 0s is rejected: " +
@@ -156,17 +152,30 @@ func (r memoryLimiterConfig) checkPercentages(ctx *rule.Context, lim rule.Memory
 	}
 }
 
-// schemaRequires reports whether the targeted release's field schema already
-// marks a processor setting required.
-func schemaRequires(ctx *rule.Context, typ, field string) bool {
-	if !ctx.SchemaReady() {
-		return false
+func (r memoryLimiterConfig) checkRange(ctx *rule.Context, lim rule.MemoryLimiter) bool {
+	found := false
+
+	for _, size := range []struct {
+		key string
+		val rule.Setting
+	}{
+		{key: "limit_mib", val: lim.LimitMiB},
+		{key: "spike_limit_mib", val: lim.SpikeMiB},
+		{key: "limit_percentage", val: lim.LimitPercent},
+		{key: "spike_limit_percentage", val: lim.SpikePercent},
+	} {
+		if !size.val.InvalidUint32() {
+			continue
+		}
+
+		found = true
+
+		ctx.Report(rule.Finding{
+			Node: lim.At(size.val), Path: rule.JoinPath(lim.Path, size.key),
+			Message: lim.Name() + " sets " + size.key + " to a value the uint32 field cannot decode",
+			Hint:    "use an unsigned integer between 0 and 4294967295", Docs: rule.MemoryLimiterDocs,
+		})
 	}
 
-	comp, ok := ctx.Schema.Lookup(config.KindProcessor, typ)
-	if !ok || comp.Fields == nil {
-		return false
-	}
-
-	return slices.Contains(comp.Fields.Required, field)
+	return found
 }

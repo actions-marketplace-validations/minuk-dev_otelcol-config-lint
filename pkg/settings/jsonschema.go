@@ -116,6 +116,7 @@ func runSchema() object {
 			"description": "Report unknown component settings as errors instead of warnings.",
 			"type":        "boolean",
 		},
+		"embedded": object{"description": "Check collector configs in Kubernetes ConfigMap data blocks.", "type": "boolean"},
 		"ignoreMissingSchemas": object{
 			"description": "Do not fail on components the schema does not describe, for a custom distribution.",
 			"type":        "boolean",
@@ -140,8 +141,14 @@ func runSchema() object {
 func kubernetesSchema() object {
 	defaults := object{
 		"enabled": object{
-			"description": "The configs run in a Kubernetes pod. Defaults to true when either memory number is written.",
-			"type":        "boolean",
+			"description": "The configs run in a Kubernetes pod. " +
+				"Defaults to true when hostNetwork or either memory number is written.",
+			"type": "boolean",
+		},
+		"hostNetwork": object{
+			"description": "Whether the pod shares the node network. Omit when unknown; " +
+				"only explicit false lowers wildcard listener findings to info.",
+			"type": "boolean",
 		},
 		"memoryRequest": ref("#/$defs/quantity", "The container's memory request, e.g. 256Mi."),
 		"memoryLimit":   ref("#/$defs/quantity", "The container's memory limit, e.g. 512Mi."),
@@ -161,6 +168,7 @@ func kubernetesSchema() object {
 				"items":       object{"type": "string"},
 			},
 			"enabled":       defaults["enabled"],
+			"hostNetwork":   defaults["hostNetwork"],
 			"memoryRequest": defaults["memoryRequest"],
 			"memoryLimit":   defaults["memoryLimit"],
 		},
@@ -203,9 +211,10 @@ func rulesSchema() object {
 			"propertyNames":        ref("#/$defs/rule", ""),
 			"additionalProperties": ref("#/$defs/severity", ""),
 		},
+		"overrides": ruleOverridesSchema(),
 		"settings": object{
-			"description": "Each rule's own settings, keyed by rule name. No built-in rule reads a " +
-				"block yet, so writing one is currently reported as an error.",
+			"description": "Each rule's own settings, keyed by rule name. " +
+				"Rules that do not support settings reject a block.",
 			"type":                 "object",
 			"propertyNames":        ref("#/$defs/rule", ""),
 			"additionalProperties": object{"type": "object"},
@@ -363,4 +372,16 @@ func ref(target, description string) object {
 	}
 
 	return out
+}
+
+func ruleOverridesSchema() object {
+	item := block("First matching entry overlays global rule policy; explicit CLI flags win.", object{
+		"paths":   object{"type": "array", "minItems": 1, "items": object{"type": "string", "minLength": 1}},
+		"disable": object{"type": "array", "items": ref("#/$defs/rule", "")},
+		"severity": object{"type": "object", "propertyNames": ref("#/$defs/rule", ""),
+			"additionalProperties": ref("#/$defs/severity", "")},
+	})
+	item["required"] = []any{"paths"}
+
+	return object{"type": "array", "items": item}
 }

@@ -40,6 +40,27 @@ service:
 `
 }
 
+func TestBooleanSpellings(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		want int
+	}{
+		{name: "true", want: 1}, {name: "True", want: 1}, {name: "TRUE", want: 1},
+		{name: "false", want: 0}, {name: "False", want: 0}, {name: "FALSE", want: 0},
+		{name: `"true"`, want: 1}, {name: `"True"`, want: 1}, {name: `"TRUE"`, want: 1},
+		{name: `"false"`, want: 1}, {name: `"False"`, want: 1}, {name: `"FALSE"`, want: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			found := check(t, exporting("    sending_queue:\n      enabled: "+tt.name))
+			assert.Len(t, found, tt.want)
+		})
+	}
+}
+
 func TestNoPersistentQueue(t *testing.T) {
 	t.Parallel()
 
@@ -213,6 +234,27 @@ exporters:
 			t.Parallel()
 
 			assert.Empty(t, check(t, src))
+		})
+	}
+}
+
+func TestNoPersistentQueueDynamicBlocks(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, settings string
+	}{
+		{name: "queue from file", settings: "{sending_queue: '${file:queue.yaml}'}"},
+		{name: "queue from environment", settings: "{sending_queue: '${env:QUEUE}'}"},
+		{name: "exporter from file", settings: "${file:exporter.yaml}"},
+		{name: "exporter from environment", settings: "${env:EXPORTER}"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			source := "exporters:\n  otlphttp: " + tt.settings +
+				"\nservice:\n  pipelines:\n    traces: {receivers: [otlp], exporters: [otlphttp]}\n"
+			assert.Empty(t, check(t, source))
 		})
 	}
 }

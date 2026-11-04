@@ -2,7 +2,9 @@ package otelcolconfiglint_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,16 +12,18 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
-	"github.com/samber/lo"
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	otelcolconfiglint "github.com/minuk-dev/otelcol-config-lint/pkg/cmd/otelcol-config-lint"
 	runcmd "github.com/minuk-dev/otelcol-config-lint/pkg/cmd/otelcol-config-lint/run"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 )
 
 // repoSchemas is the committed schema fixture. The binary reads the published
@@ -100,8 +104,199 @@ func TestValidDirectoryPasses(t *testing.T) {
 		t.Fatalf("exit %d, stdout=%q stderr=%q", code, out, errOut)
 	}
 
-	if out != "" {
-		t.Errorf("a clean run should print nothing, got %q", out)
+	assert.Contains(t, out, "agent.yaml: validation coverage partial")
+	assert.Contains(t, out, "2 runtime value(s)")
+	assert.Equal(t, 1, strings.Count(out, "validation coverage"), "group repeated gaps once per file")
+	assert.NotContains(t, out, "error:")
+}
+
+func TestDynamicReferencesKeepLiteralFailures(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile(filepath.Join(validConfig, "agent.yaml"))
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name, receivers string
+		code            int
+	}{
+		{name: "unresolved", receivers: `"${env:RECEIVER_ID}"`, code: 0},
+		{name: "literal missing beside unresolved", receivers: `"${env:RECEIVER_ID}", missing`, code: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dynamic := strings.ReplaceAll(string(src), "receivers: [otlp]", "receivers: ["+tt.receivers+"]")
+			code, stdout, stderr := lint(t, dynamic,
+				"--collector-version", "v0.157.0", "--distribution", "core", "--min-severity", "warning", "-")
+			assert.Equal(t, tt.code, code, "%s\n%s", stdout, stderr)
+			assert.NotContains(t, stdout, "RECEIVER_ID")
+			assert.NotContains(t, stdout, "unused-component")
+			assert.Empty(t, stderr)
+
+			if tt.code != 0 {
+				assert.Contains(t, stdout, `"missing"`)
+				assert.Contains(t, stdout, "undefined-reference")
+			}
+		})
+	}
+}
+
+func TestIdentifierValidation(t *testing.T) {
+	t.Parallel()
+
+	agent, err := os.ReadFile(filepath.Join(validConfig, "agent.yaml"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name      string
+		receiver  string
+		reference string
+		pipeline  string
+		wantRule  string
+		wantCount int
+	}{
+		{
+			name: "empty component name", receiver: "otlp/", reference: "otlp/", pipeline: "traces",
+			wantRule: "invalid-component-id", wantCount: 4,
+		},
+		{
+			name: "empty reference name", receiver: "otlp", reference: "otlp/", pipeline: "traces",
+			wantRule: "invalid-component-id", wantCount: 3,
+		},
+		{
+			name: "empty pipeline name", receiver: "otlp", reference: "otlp", pipeline: "traces/",
+			wantRule: "invalid-pipeline-key", wantCount: 1,
+		},
+		{
+			name: "invalid component character", receiver: "otlp/a+b", reference: "otlp/a+b", pipeline: "traces",
+			wantRule: "invalid-component-id", wantCount: 4,
+		},
+		{
+			name: "invalid pipeline character", receiver: "otlp", reference: "otlp", pipeline: "traces/a b",
+			wantRule: "invalid-pipeline-key", wantCount: 1,
+		},
+		{
+			name: "valid named instances", receiver: "otlp/내부/a-1", reference: "otlp/내부/a-1", pipeline: "traces/2",
+			wantRule: "", wantCount: 0,
+		},
+		{
+			name: "trimmed instances resolve", receiver: " otlp / internal ", reference: "otlp/internal",
+			pipeline: " traces / internal ", wantRule: "", wantCount: 0,
+		},
+	}
+
+	for _, version := range []string{"v0.110.0", "v0.157.0"} {
+		for _, tt := range tests {
+			t.Run(version+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				src := strings.ReplaceAll(string(agent), "  otlp:", "  "+strconv.Quote(tt.receiver)+":")
+				src = strings.ReplaceAll(src, "[otlp]", "["+strconv.Quote(tt.reference)+"]")
+				src = strings.ReplaceAll(src, "    traces:", "    "+strconv.Quote(tt.pipeline)+":")
+
+				code, out, errOut := lint(t, src, "--no-config", "--collector-version", version, "--output", "json", "-")
+				if tt.wantRule == "" {
+					assert.Equal(t, otelcolconfiglint.ExitOK, code, "%s\n%s", out, errOut)
+
+					return
+				}
+
+				assert.Equal(t, otelcolconfiglint.ExitInvalid, code, "%s\n%s", out, errOut)
+				lines := reportedLines(t, out, tt.wantRule)
+				require.Len(t, lines, tt.wantCount, "%s", out)
+
+				for _, line := range lines {
+					assert.Positive(t, line)
+				}
+			})
+		}
+	}
+}
+
+func TestPreCancelledRunCannotPass(t *testing.T) {
+	t.Parallel()
+
+	for _, earlyExit := range []bool{false, true} {
+		t.Run(strconv.FormatBool(earlyExit), func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			var stdout bytes.Buffer
+
+			cmd := otelcolconfiglint.NewCommand(nil)
+			cmd.SetArgs([]string{"run", "--no-config", "--schema-location", repoSchemas,
+				"--exit-on-error=" + strconv.FormatBool(earlyExit), filepath.Join(validConfig, "agent.yaml")})
+			cmd.SetOut(&stdout)
+			cmd.SetErr(&bytes.Buffer{})
+			err := cmd.ExecuteContext(ctx)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Equal(t, otelcolconfiglint.ExitUsage, otelcolconfiglint.ExitCode(err))
+			assert.Empty(t, stdout.String())
+		})
+	}
+}
+
+func TestEmbeddedFlagAnnotatesMultipleConfigMaps(t *testing.T) {
+	t.Parallel()
+
+	src := `kind: ConfigMap
+metadata:
+  name: agent
+data:
+  config: |
+    receivers:
+      otlp:
+    service:
+      pipelines:
+        traces:
+          receivers: [missing]
+          exporters: [debug]
+`
+	src += "---\n" + strings.Replace(src, "name: agent", "name: gateway", 1)
+	code, out, errOut := lint(t, src, "--embedded", "--output", "github", "-")
+	require.Equal(t, 1, code, errOut)
+	assert.Contains(t, out, "file=stdin,line=11,col=23")
+	assert.Contains(t, out, "agent/config")
+	assert.Contains(t, out, "gateway/config")
+}
+
+func TestTrailingConfigDocumentsFail(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile(filepath.Join(validConfig, "agent.yaml"))
+	require.NoError(t, err)
+
+	for name, trailing := range map[string]string{
+		"valid": "service: {}\n", "empty": "", "malformed": "this is: [broken\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			content := string(src) + "\n---\n" + trailing
+			file, err := os.CreateTemp(t.TempDir(), "config-*.yaml")
+			require.NoError(t, err)
+			_, err = file.WriteString(content)
+			require.NoError(t, err)
+			require.NoError(t, file.Close())
+
+			for inputName, input := range map[string]string{"file": file.Name(), "stdin": "-"} {
+				t.Run(inputName, func(t *testing.T) {
+					t.Parallel()
+
+					code, out, errOut := lint(t, content, "--no-config", input)
+					assert.Equal(t, 1, code, errOut)
+					assert.Contains(t, out, "yaml-syntax")
+
+					if name == "malformed" {
+						assert.Contains(t, out, "expected")
+					} else {
+						assert.Contains(t, out, "more than one document")
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -120,6 +315,137 @@ func TestInvalidFileFails(t *testing.T) {
 	}
 }
 
+func TestMalformedServiceReferencesFail(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile(filepath.Join(validConfig, "agent.yaml"))
+	require.NoError(t, err)
+
+	for slot, refs := range map[string]string{
+		"receivers": "otlp", "processors": "memory_limiter, batch",
+		"exporters": "debug", "extensions": "zpages",
+	} {
+		t.Run(slot, func(t *testing.T) {
+			t.Parallel()
+
+			bad := strings.Replace(string(src), slot+": ["+refs+"]",
+				slot+": ["+refs+", {bogus: true}]", 1)
+			require.NotEqual(t, string(src), bad)
+
+			code, out, errOut := lint(t, bad, "--no-config", "--collector-version", "v0.157.0", "--output", "json", "-")
+			require.Equal(t, 1, code, errOut)
+
+			var report struct {
+				Files []struct {
+					Status      string           `json:"status"`
+					Diagnostics diag.Diagnostics `json:"diagnostics"`
+				} `json:"files"`
+			}
+
+			require.NoError(t, json.Unmarshal([]byte(out), &report))
+			require.Len(t, report.Files, 1)
+			assert.Equal(t, "invalid", report.Files[0].Status)
+			found := slices.DeleteFunc(report.Files[0].Diagnostics, func(d diag.Diagnostic) bool {
+				return d.Rule != "wrong-node-type"
+			})
+			require.Len(t, found, 1)
+			d := found[0]
+			assert.Equal(t, "wrong-node-type", d.Rule)
+			assert.Equal(t, diag.Error, d.Severity)
+			assert.Positive(t, d.Position.Line)
+			assert.Positive(t, d.Position.Column)
+		})
+	}
+}
+
+type countedFS struct {
+	afero.Fs
+
+	path  string
+	opens atomic.Int64
+}
+
+func (f *countedFS) Open(name string) (afero.File, error) {
+	if name == f.path {
+		f.opens.Add(1)
+	}
+
+	return f.Fs.Open(name)
+}
+
+type cancelOnOpenFS struct {
+	afero.Fs
+
+	path   string
+	cancel context.CancelFunc
+}
+
+func (f *cancelOnOpenFS) Open(name string) (afero.File, error) {
+	if name == f.path {
+		f.cancel()
+	}
+
+	return f.Fs.Open(name)
+}
+
+func TestCancelledRunStopsReadingLaterFiles(t *testing.T) {
+	t.Parallel()
+
+	for _, earlyExit := range []bool{false, true} {
+		t.Run(strconv.FormatBool(earlyExit), func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			first := filepath.Join(validConfig, "agent.yaml")
+			later := filepath.Join(t.TempDir(), "later.yaml")
+			require.NoError(t, os.WriteFile(later, []byte("service: {}\n"), 0o600))
+			fsys := &countedFS{
+				Fs:    &cancelOnOpenFS{Fs: afero.NewOsFs(), path: first, cancel: cancel},
+				path:  later,
+				opens: atomic.Int64{},
+			}
+
+			var stdout bytes.Buffer
+
+			cmd := otelcolconfiglint.NewCommand(&otelcolconfiglint.GlobalCmdOptions{Fs: fsys})
+			cmd.SetArgs([]string{"run", "--no-config", "--schema-location", repoSchemas,
+				"--concurrency=1", "--exit-on-error=" + strconv.FormatBool(earlyExit), first, later})
+			cmd.SetOut(&stdout)
+			cmd.SetErr(&bytes.Buffer{})
+			err := cmd.ExecuteContext(ctx)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Equal(t, otelcolconfiglint.ExitUsage, otelcolconfiglint.ExitCode(err))
+			assert.Zero(t, fsys.opens.Load())
+			assert.Empty(t, stdout.String())
+		})
+	}
+}
+
+func TestExitOnErrorStopsReadingLaterFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	first, later := filepath.Join(dir, "a.yaml"), filepath.Join(dir, "b.yaml")
+	require.NoError(t, os.WriteFile(first, []byte("receivers: [\n"), 0o600))
+	require.NoError(t, os.WriteFile(later, []byte("service: {}\n"), 0o600))
+
+	fsys := &countedFS{Fs: afero.NewOsFs(), path: later, opens: atomic.Int64{}}
+	cmd := otelcolconfiglint.NewCommand(&otelcolconfiglint.GlobalCmdOptions{Fs: fsys})
+	cmd.SetArgs([]string{"run", "--schema-location", repoSchemas, "--exit-on-error", first, later})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+
+	if code := otelcolconfiglint.ExitCode(cmd.Execute()); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+
+	if got := fsys.opens.Load(); got != 0 {
+		t.Fatalf("later file was read %d times after first failure", got)
+	}
+}
+
 func TestStdin(t *testing.T) {
 	t.Parallel()
 
@@ -130,6 +456,34 @@ func TestStdin(t *testing.T) {
 
 	if !strings.Contains(out, "stdin:") {
 		t.Errorf("stdin findings should be reported against \"stdin\":\n%s", out)
+	}
+}
+
+func TestStdinAndFilesKeepPathOrder(t *testing.T) {
+	t.Parallel()
+
+	for _, earlyExit := range []bool{false, true} {
+		t.Run(strconv.FormatBool(earlyExit), func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(validConfig, "agent.yaml")
+			src, err := os.ReadFile(path)
+			require.NoError(t, err)
+			code, out, errOut := lint(t, string(src), "--no-config", "--min-severity", "error",
+				"--output", "json", "--verbose", "--exit-on-error="+strconv.FormatBool(earlyExit), path, "-")
+			require.Zero(t, code, errOut)
+
+			var report struct {
+				Files []struct {
+					Filename string `json:"filename"`
+				} `json:"files"`
+			}
+
+			require.NoError(t, json.Unmarshal([]byte(out), &report))
+			require.Len(t, report.Files, 2)
+			assert.Equal(t, "stdin", report.Files[0].Filename)
+			assert.Equal(t, path, report.Files[1].Filename)
+		})
 	}
 }
 
@@ -196,6 +550,66 @@ func TestJUnitAndTAPOutput(t *testing.T) {
 	_, tap, _ := lint(t, "", "--output", "tap", badConfig)
 	if !strings.HasPrefix(tap, "1..1\nnot ok 1 - ") {
 		t.Errorf("unexpected tap output:\n%s", tap)
+	}
+}
+
+func TestJUnitFailureThresholds(t *testing.T) {
+	t.Parallel()
+
+	const src = "receivers:\n  otlp:\n    protocols:\n      grpc:\n        endpiont: localhost:4317\n"
+
+	for _, tt := range []struct {
+		name        string
+		severity    string
+		failOn      string
+		minSeverity string
+		wantCode    int
+	}{
+		{name: "warning passes", severity: "warning", failOn: "error", minSeverity: "info", wantCode: 0},
+		{name: "warning fails", severity: "warning", failOn: "warning", minSeverity: "info", wantCode: 1},
+		{name: "hidden warning fails", severity: "warning", failOn: "warning", minSeverity: "error", wantCode: 1},
+		{name: "info passes", severity: "info", failOn: "warning", minSeverity: "info", wantCode: 0},
+		{name: "info fails", severity: "info", failOn: "info", minSeverity: "info", wantCode: 1},
+		{name: "hidden info fails", severity: "info", failOn: "info", minSeverity: "error", wantCode: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			input, ruleName := src, "unknown-field"
+			if tt.severity == "info" {
+				// unknown-field sets each finding's severity; use a rule that accepts overrides for info.
+				input, ruleName = "recievers: {}\n", "unknown-top-level-key"
+			}
+
+			code, out, errOut := lint(t, input,
+				"--no-config", "--collector-version", "v0.157.0", "--default", "none", "--enable", ruleName,
+				"--strict=false", "--severity", ruleName+"="+tt.severity, "--fail-on", tt.failOn,
+				"--min-severity", tt.minSeverity, "--output", "junit", "-",
+			)
+			require.Equal(t, tt.wantCode, code, errOut)
+
+			var report struct {
+				Tests    int `xml:"tests,attr"`
+				Failures int `xml:"failures,attr"`
+				Errors   int `xml:"errors,attr"`
+				Cases    []struct {
+					Failures []struct {
+						Message string `xml:"message,attr"`
+					} `xml:"failure"`
+				} `xml:"testcase"`
+			}
+
+			require.NoError(t, xml.Unmarshal([]byte(out), &report))
+			assert.Equal(t, 1, report.Tests)
+			assert.Equal(t, tt.wantCode, report.Failures)
+			assert.Zero(t, report.Errors)
+			require.Len(t, report.Cases, 1)
+			require.Len(t, report.Cases[0].Failures, tt.wantCode)
+
+			if tt.wantCode != 0 {
+				assert.NotEmpty(t, report.Cases[0].Failures[0].Message)
+			}
+		})
 	}
 }
 
@@ -328,6 +742,57 @@ func TestAllowNearestFallbackChecksAgainstTheOlderRelease(t *testing.T) {
 	assert.Contains(t, errOut, "falling back to", "the fallback should still be announced")
 }
 
+func TestSchemaIdentityMismatchEndsTheRun(t *testing.T) {
+	t.Parallel()
+
+	for name, tt := range map[string]struct {
+		version, distribution, wantErr string
+	}{
+		"version":      {"v0.110.0", "core", `collectorVersion is "v0.110.0", want "v0.157.0"`},
+		"distribution": {"v0.157.0", "contrib", `distribution is "contrib", want "core"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			path := filepath.Join(dir, "v0.157.0.json")
+			body := `{"collectorVersion":"` + tt.version + `","distribution":"` + tt.distribution +
+				`","components":{"receiver":{"otlp":{}}}}`
+			require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+
+			for mode, version := range map[string]string{
+				"file": "v0.157.0", "latest": "latest", "fallback": "v0.158.0",
+			} {
+				t.Run(mode, func(t *testing.T) {
+					t.Parallel()
+
+					location := dir
+					if mode == "file" {
+						location = path
+					}
+
+					code, out, errOut := run(t, "receivers: {}", "run", "--no-config",
+						"--schema-location", location, "--collector-version", version, "--distribution", "core",
+						"--allow-nearest-fallback", "--ignore-missing-schemas", "--output", "json", "-")
+					require.Equal(t, otelcolconfiglint.ExitUsage, code, "%s", errOut)
+					assert.Empty(t, out)
+					assert.Contains(t, errOut, "load schema")
+					assert.Contains(t, errOut, "schema identity mismatch")
+					assert.Contains(t, errOut, tt.wantErr)
+					assert.Contains(t, errOut, location)
+					assert.Contains(t, errOut, "--schema-location")
+
+					if mode == "fallback" {
+						assert.Contains(t, errOut, "falling back to v0.157.0")
+					} else {
+						assert.NotContains(t, errOut, "falling back")
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestAllowNearestFallbackIsAlsoASettingsKey pins that the opt-in can be
 // committed, since a repository tracking ahead of the registry does so for
 // every run rather than one.
@@ -378,6 +843,85 @@ func TestSchemaLocationOverridesTheBuiltins(t *testing.T) {
 		"--schema-location", dir, "--collector-version", "v9.9.9", "--min-severity", "error", "-")
 	if code != 0 {
 		t.Errorf("a project schema should be honoured, got exit %d:\n%s%s", code, out, errOut)
+	}
+}
+
+func TestEmptySchemaEndsTheRun(t *testing.T) {
+	t.Parallel()
+
+	const src = `receivers:
+  imaginaryreceiver: {}
+exporters:
+  imaginaryexporter: {}
+service:
+  pipelines:
+    traces:
+      receivers: [imaginaryreceiver]
+      exporters: [imaginaryexporter]
+`
+
+	for name, input := range map[string]string{
+		"empty object":     `{}`,
+		"null":             `null`,
+		"empty inventory":  `{"collectorVersion":"v0.157.0","components":{}}`,
+		"empty kinds":      `{"components":{"receiver":{},"processor":{},"exporter":{},"connector":{},"extension":{}}}`,
+		"YAML empty kinds": "components:\n  receiver: {}\n  exporter: {}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(dir, "contrib"), 0o700))
+			path := filepath.Join(dir, "contrib", "v0.157.0.json")
+			require.NoError(t, os.WriteFile(path, []byte(input), 0o600))
+
+			index := `{"distributions":{"contrib":["v0.157.0"]},"extensions":{"contrib":".json"}}`
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "index.json"), []byte(index), 0o600))
+
+			srv := httptest.NewServer(http.FileServer(http.Dir(dir)))
+			t.Cleanup(srv.Close)
+
+			for location, target := range map[string]string{
+				"local file":      path,
+				"local registry":  dir,
+				"remote registry": srv.URL,
+			} {
+				t.Run(location, func(t *testing.T) {
+					t.Parallel()
+
+					versions := map[string]string{"exact": "v0.157.0"}
+					if location != "local file" {
+						versions["latest"] = "latest"
+						versions["fallback"] = "v0.158.0"
+					}
+
+					for mode, version := range versions {
+						t.Run(mode, func(t *testing.T) {
+							t.Parallel()
+
+							code, out, errOut := run(t, src, "run", "--no-config", "--no-cache",
+								"--insecure-schema-location", "--schema-location", target,
+								"--collector-version", version, "--allow-nearest-fallback",
+								"--ignore-missing-schemas", "--output", "json", "-")
+							require.Equal(t, otelcolconfiglint.ExitUsage, code, "%s", errOut)
+							assert.Empty(t, out, "an unusable schema must not emit a lint result")
+
+							if strings.Contains(input, "collectorVersion") {
+								assert.Contains(t, errOut, "load schema: component inventory is empty")
+							} else {
+								assert.Contains(t, errOut, `schema identity mismatch: collectorVersion is ""`)
+							}
+
+							assert.Contains(t, errOut, "--schema-location")
+
+							if mode == "fallback" {
+								assert.Contains(t, errOut, "falling back to v0.157.0")
+							}
+						})
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -478,9 +1022,8 @@ func TestAnEmptySettingsFileKeepsTheDefaults(t *testing.T) {
 		t.Fatalf("exit %d, stdout=%q stderr=%q", code, out, errOut)
 	}
 
-	if out != "" {
-		t.Errorf("the default text output should stay in force, got %q", out)
-	}
+	assert.Contains(t, out, "agent.yaml: validation coverage partial")
+	assert.NotContains(t, out, `"files":`, "the default output stays text")
 }
 
 // TestOptionsFsRunsEntirelyInMemory pins that Options.Fs governs every file the
@@ -892,20 +1435,29 @@ func findings(t *testing.T, out string) map[string][]finding {
 		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
 	}
 
-	byFile := lo.GroupBy(report.Files, func(f fileReport) string { return filepath.Base(f.Filename) })
+	byFile := make(map[string][]finding)
 
-	return lo.MapValues(byFile, func(files []fileReport, _ string) []finding {
-		return lo.FlatMap(files, func(f fileReport, _ int) []finding { return f.Diagnostics })
-	})
+	for _, f := range report.Files {
+		base := filepath.Base(f.Filename)
+		byFile[base] = append(byFile[base], f.Diagnostics...)
+	}
+
+	return byFile
 }
 
 // rulesFired returns the rules each file in a JSON report was flagged by.
 func rulesFired(t *testing.T, out string) map[string][]string {
 	t.Helper()
 
-	return lo.MapValues(findings(t, out), func(found []finding, _ string) []string {
-		return lo.Map(found, func(d finding, _ int) string { return d.Rule })
-	})
+	rules := make(map[string][]string)
+
+	for file, found := range findings(t, out) {
+		for _, d := range found {
+			rules[file] = append(rules[file], d.Rule)
+		}
+	}
+
+	return rules
 }
 
 // TestEnvironmentIsResolvedPerFile is the point of the whole kubernetes block:
@@ -1086,7 +1638,7 @@ func TestMemoryLimiterConfigReachesTheCommandLine(t *testing.T) {
 func TestAWorkingLimiterPassesTheCommandLine(t *testing.T) {
 	t.Parallel()
 
-	code, out, errOut := lint(t, limiterConfig, "--fail-on", "info", "--min-severity", "warning", "-")
+	code, out, errOut := lint(t, limiterConfig, "--fail-on", "warning", "--min-severity", "warning", "-")
 	require.Equal(t, 0, code, "a recommended limiter should pass: %s%s", out, errOut)
 }
 
@@ -1105,9 +1657,16 @@ func TestFindingsCiteUpstreamInEveryFormat(t *testing.T) {
 	assert.Contains(t, text, docs)
 
 	_, out, _ := lint(t, src, "--output", "json", "-")
-	cited := lo.ContainsBy(findings(t, out)["stdin"], func(d finding) bool {
-		return d.Rule == "memory-limiter-config" && strings.Contains(d.Docs, docs)
-	})
+	cited := false
+
+	for _, d := range findings(t, out)["stdin"] {
+		if d.Rule == "memory-limiter-config" && strings.Contains(d.Docs, docs) {
+			cited = true
+
+			break
+		}
+	}
+
 	assert.True(t, cited, "the JSON report should carry a docs field:\n%s", out)
 
 	_, github, _ := lint(t, src, "--output", "github", "-")
@@ -1160,7 +1719,12 @@ kubernetes:
 
 	found := findings(t, out)
 	said := func(file string) string {
-		return strings.Join(lo.Map(found[file], func(d finding, _ int) string { return d.Message }), "\n")
+		messages := make([]string, 0, len(found[file]))
+		for _, d := range found[file] {
+			messages = append(messages, d.Message)
+		}
+
+		return strings.Join(messages, "\n")
 	}
 
 	assert.Contains(t, said("other.yaml"), "memory request of 128Mi",
@@ -1324,6 +1888,125 @@ func TestSharedFlagsAgreeAcrossCommands(t *testing.T) {
 
 				assert.Equalf(t, first, spelling, "%s declares --%s differently", where, name)
 			}
+		})
+	}
+}
+
+func TestNullSettingDefaults(t *testing.T) {
+	t.Parallel()
+
+	src, err := os.ReadFile(filepath.Join(validConfig, "agent.yaml"))
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name string
+		old  string
+		new  string
+		code int
+		rule string
+		path string
+	}{
+		{
+			name: "required interval", old: "check_interval: 1s", new: "check_interval: %s",
+			code: 1, rule: "memory-limiter-config", path: "processors.memory_limiter.check_interval",
+		},
+		{
+			name: "required limit", old: "limit_mib: 512", new: "limit_mib: %s",
+			code: 1, rule: "memory-limiter-config", path: "processors.memory_limiter.limit_mib",
+		},
+		{
+			name: "null batch size decodes to zero", old: "send_batch_size: 8192",
+			new:  "send_batch_size: %s\n    send_batch_max_size: 1000",
+			code: 0, rule: "", path: "",
+		},
+		{
+			name: "valid null batch size with large cap", old: "send_batch_size: 8192",
+			new: "send_batch_size: %s\n    send_batch_max_size: 8192", code: 0, rule: "", path: "",
+		},
+		{name: "null timeout decodes to zero", old: "timeout: 5s", new: "timeout: %s", code: 0, rule: "", path: ""},
+		{
+			name: "uncapped batches", old: "send_batch_size: 8192",
+			new: "send_batch_size: 8192\n    send_batch_max_size: %s", code: 0, rule: "", path: "",
+		},
+		{
+			name: "default spike", old: "spike_limit_mib: 128", new: "spike_limit_mib: %s", code: 0, rule: "", path: "",
+		},
+		{
+			name: "percentage limit with default fixed limit", old: "limit_mib: 512",
+			new: "limit_mib: %s\n    limit_percentage: 80\n    spike_limit_percentage: 20", code: 0, rule: "", path: "",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			for name, value := range map[string]string{"null": "null", "shorthand": "~", "empty": ""} {
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+
+					input := strings.Replace(string(src), tt.old, fmt.Sprintf(tt.new, value), 1)
+					require.NotEqual(t, string(src), input)
+					code, out, errOut := lint(t, input, "--no-config", "--collector-version", "v0.157.0",
+						"--min-severity", "error", "--verbose", "--output", "json", "-")
+					require.Equal(t, tt.code, code, "stdout=%s stderr=%s", out, errOut)
+
+					var report struct {
+						Files []struct {
+							Status      string           `json:"status"`
+							Diagnostics diag.Diagnostics `json:"diagnostics"`
+						} `json:"files"`
+					}
+
+					require.NoError(t, json.Unmarshal([]byte(out), &report))
+					require.Len(t, report.Files, 1)
+
+					if tt.code == 0 {
+						assert.Equal(t, "valid", report.Files[0].Status)
+						assert.Empty(t, report.Files[0].Diagnostics)
+
+						return
+					}
+
+					assert.Equal(t, "invalid", report.Files[0].Status)
+					require.Len(t, report.Files[0].Diagnostics, 1, "avoid duplicate errors for required nulls")
+					d := report.Files[0].Diagnostics[0]
+					assert.Equal(t, tt.rule, d.Rule)
+					assert.Equal(t, tt.path, d.Path)
+					assert.Equal(t, diag.Error, d.Severity)
+					assert.Positive(t, d.Position.Line)
+				})
+			}
+		})
+	}
+}
+
+func TestMemoryLimiterRequiredInterval(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		interval string
+		code     int
+	}{
+		{name: "missing interval is required", interval: "", code: 1},
+		{name: "runtime interval stays unknown", interval: "    check_interval: ${env:INTERVAL}\n", code: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			code, out, errOut := lint(t, limiterWith(tt.interval+"    limit_mib: 512"),
+				"--no-config", "--collector-version", "v0.157.0", "--min-severity", "error", "--output", "json", "-")
+			require.Equal(t, tt.code, code, "stdout=%s stderr=%s", out, errOut)
+
+			found := findings(t, out)["stdin"]
+			if tt.code == 0 {
+				assert.Empty(t, found)
+
+				return
+			}
+
+			require.Len(t, found, 2)
+			assert.ElementsMatch(t, []string{"memory-limiter-config", "required-field"},
+				[]string{found[0].Rule, found[1].Rule})
 		})
 	}
 }

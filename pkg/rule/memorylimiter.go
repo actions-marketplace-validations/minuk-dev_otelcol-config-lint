@@ -3,7 +3,6 @@ package rule
 import (
 	"math"
 
-	"github.com/samber/mo"
 	"gopkg.in/yaml.v3"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
@@ -39,10 +38,17 @@ type MemoryLimiter struct {
 	SpikePercent  Setting
 }
 
-// MemoryLimiters returns every declared memory_limiter. Instances are matched
+// MemoryLimiters returns memory_limiters with statically readable settings. Instances are matched
 // on their type, so "memory_limiter/aggressive" is covered too.
 func MemoryLimiters(f *config.File) []MemoryLimiter {
-	return ProcessorsOfType(f, MemoryLimiterType, readMemoryLimiter)
+	return (&Context{File: f}).MemoryLimiters()
+}
+
+// MemoryLimiters reads memory limiters using the target Collector scalar decoder.
+func (c *Context) MemoryLimiters() []MemoryLimiter {
+	return ProcessorsOfType(c.File, MemoryLimiterType, func(comp config.Component) MemoryLimiter {
+		return readMemoryLimiter(c, comp)
+	})
 }
 
 // Name renders the instance for a message, so two findings about the same
@@ -61,9 +67,9 @@ func (m MemoryLimiter) At(s Setting) *yaml.Node { return NodeOr(s.Node, m.Node) 
 // A value resolved at runtime leaves the whole figure unknown: a partly known
 // hard limit is worse than none, since every finding about it would be
 // confident about a number nobody has yet.
-func (m MemoryLimiter) HardLimit(env Environment) mo.Option[int64] {
+func (m MemoryLimiter) HardLimit(env Environment) (int64, bool) {
 	if m.LimitMiB.Unknown() || m.LimitPercent.Unknown() {
-		return mo.None[int64]()
+		return 0, false
 	}
 
 	// A figure that does not fit in a byte count is left unknown rather than
@@ -71,24 +77,24 @@ func (m MemoryLimiter) HardLimit(env Environment) mo.Option[int64] {
 	// nowhere in the config, and a finding quoting it would be worse than none.
 	if m.LimitMiB.Positive() {
 		if m.LimitMiB.Num > math.MaxInt64/mib {
-			return mo.None[int64]()
+			return 0, false
 		}
 
-		return mo.Some(m.LimitMiB.Num * mib)
+		return m.LimitMiB.Num * mib, true
 	}
 
 	if m.LimitPercent.Positive() && env.MemoryLimit > 0 {
 		if env.MemoryLimit > math.MaxInt64/m.LimitPercent.Num {
-			return mo.None[int64]()
+			return 0, false
 		}
 
-		return mo.Some(env.MemoryLimit * m.LimitPercent.Num / WholePercent)
+		return env.MemoryLimit * m.LimitPercent.Num / WholePercent, true
 	}
 
-	return mo.None[int64]()
+	return 0, false
 }
 
-func readMemoryLimiter(c config.Component) MemoryLimiter {
+func readMemoryLimiter(ctx *Context, c config.Component) MemoryLimiter {
 	lim := MemoryLimiter{
 		ID:            c.ID,
 		Node:          NodeOr(c.KeyNode, c.ValueNode),
@@ -109,13 +115,13 @@ func readMemoryLimiter(c config.Component) MemoryLimiter {
 		case "check_interval":
 			lim.CheckInterval = ReadDuration(e.Node)
 		case "limit_mib":
-			lim.LimitMiB = ReadInt(e.Node)
+			lim.LimitMiB = ctx.ReadInt(e.Node)
 		case "limit_percentage":
-			lim.LimitPercent = ReadInt(e.Node)
+			lim.LimitPercent = ctx.ReadInt(e.Node)
 		case "spike_limit_mib":
-			lim.SpikeMiB = ReadInt(e.Node)
+			lim.SpikeMiB = ctx.ReadInt(e.Node)
 		case "spike_limit_percentage":
-			lim.SpikePercent = ReadInt(e.Node)
+			lim.SpikePercent = ctx.ReadInt(e.Node)
 		default:
 			// Every other setting is the field schema's business.
 		}

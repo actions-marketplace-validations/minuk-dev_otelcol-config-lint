@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -10,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // File is a parsed collector config.
@@ -18,6 +21,8 @@ type File struct {
 	Path string
 	// Root is the top-level mapping node, or nil for an empty document.
 	Root *yaml.Node
+	// HeadComments holds standalone YAML comments preceding nodes, by source line.
+	HeadComments map[int]string
 
 	// Sections holds the declared components of each kind, in file order.
 	Sections map[Kind]*Section
@@ -190,15 +195,29 @@ func ParseFile(fsys afero.Fs, path string) (*File, error) {
 	return Parse(path, src)
 }
 
-// Parse parses config source that was read from path.
+// Parse parses a single config document that was read from path.
 //
 // A syntax error is returned as a *SyntaxError so callers can report it as a
 // diagnostic instead of a hard failure.
 func Parse(path string, src []byte) (*File, error) {
 	var doc yaml.Node
 
-	err := yaml.Unmarshal(src, &doc)
-	if err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(src))
+
+	err := dec.Decode(&doc)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, syntaxError(path, err)
+	}
+
+	var extra yaml.Node
+
+	err = dec.Decode(&extra)
+	if err == nil {
+		return nil, &SyntaxError{Path: path, Line: extra.Line, Column: extra.Column,
+			Msg: "config must contain no more than one document"}
+	}
+
+	if !errors.Is(err, io.EOF) {
 		return nil, syntaxError(path, err)
 	}
 
@@ -214,6 +233,13 @@ func Parse(path string, src []byte) (*File, error) {
 	}
 
 	f.Root = root
+
+	_, err = expandedSize(path, root, map[*yaml.Node]int{})
+	if err != nil {
+		return nil, err
+	}
+
+	f.HeadComments = headComments(root, strings.Split(string(src), "\n"))
 
 	// Duplicates are collected from the document as written, before anything
 	// is merged into it: a key the config writes itself replaces one a merge
@@ -301,10 +327,10 @@ func telemetrySignal(e Entry) *TelemetrySignal {
 }
 
 func parsePipeline(e Entry) Pipeline {
-	signal, name, _ := strings.Cut(e.Key, "/")
+	id := ParseID(e.Key)
 
 	p := Pipeline{
-		Key: e.Key, Signal: Signal(signal), Name: name,
+		Key: e.Key, Signal: Signal(id.Type), Name: id.Name,
 		KeyNode: e.KeyNode, Node: e.Node,
 	}
 	for _, sub := range entries(e.Node, e.Path) {
@@ -359,7 +385,8 @@ func entries(n *yaml.Node, parentPath string) []Entry {
 	out := make([]Entry, 0, len(n.Content)/mappingStride)
 	for i := 0; i+1 < len(n.Content); i += mappingStride {
 		k, v := n.Content[i], n.Content[i+1]
-		out = append(out, Entry{Key: k.Value, KeyNode: k, Node: v, Path: join(parentPath, k.Value)})
+		key := aliasTarget(k).Value
+		out = append(out, Entry{Key: key, KeyNode: k, Node: v, Path: join(parentPath, key)})
 	}
 
 	return out
@@ -373,13 +400,13 @@ func collectDuplicates(n *yaml.Node, path string) []Entry {
 
 	switch n.Kind {
 	case yaml.MappingNode:
-		seen := map[string]bool{}
+		seen := sets.New[string]()
 		for _, e := range entries(n, path) {
-			if seen[e.Key] {
+			if seen.Has(e.Key) {
 				out = append(out, e)
 			}
 
-			seen[e.Key] = true
+			seen.Insert(e.Key)
 			out = append(out, collectDuplicates(e.Node, e.Path)...)
 		}
 	case yaml.SequenceNode:

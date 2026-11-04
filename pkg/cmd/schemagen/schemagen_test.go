@@ -9,11 +9,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/cmd/schemagen"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/invalidvalue"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/ruletest"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
 )
 
@@ -137,6 +140,89 @@ func TestIncompleteManifest(t *testing.T) {
 	assert.Equal(t, schemagen.ExitFailure, code)
 	assert.Contains(t, stderr, "dist.name is required")
 	assert.Contains(t, stderr, "1 of 1 manifests could not be generated")
+}
+
+func TestGenerateRejectsUnsafeIdentity(t *testing.T) {
+	t.Parallel()
+
+	values := map[string]string{
+		"parent": "..", "traversal": "../../victim", "slash": "custom/child",
+		"backslash": `custom\child`, "windows absolute": `C:\victim`, "UNC": `\\server\victim`,
+		"dot": ".", "whitespace": "custom child", "control": "custom\tchild", "absolute": "/victim",
+	}
+
+	for label, value := range values {
+		for _, field := range []string{"name", "override", "version", "otelcol_version", "pinned"} {
+			t.Run(label+"/"+field, func(t *testing.T) {
+				t.Parallel()
+
+				root := t.TempDir()
+				input := value
+
+				if label == "absolute" {
+					input = filepath.Join(root, "victim")
+				}
+
+				path := singleComponentManifest(t, root)
+				body := readFile(t, path)
+				builder := path
+
+				switch field {
+				case "name":
+					body = strings.Replace(body, "name: custom", fmt.Sprintf("name: %q", input), 1)
+				case "override":
+					builder = input + "=" + path
+				case "version":
+					body = strings.Replace(body, "name: custom", fmt.Sprintf("name: custom\n  version: %q", input), 1)
+				case "otelcol_version":
+					body = strings.Replace(body, "otelcol_version: 0.157.0", fmt.Sprintf("otelcol_version: %q", input), 1)
+				case "pinned":
+					body = fmt.Sprintf("dist:\n  name: custom\n  version: 0.157.0\nreceivers:\n  - gomod: %q\n",
+						"go.opentelemetry.io/collector/receiver/otlpreceiver v0."+input)
+				}
+
+				writeFile(t, path, body)
+
+				cache := filepath.Join(root, "cache")
+				registry := filepath.Join(root, "registry")
+				victim := filepath.Join(root, "victim")
+				require.NoError(t, os.MkdirAll(victim, 0o750))
+				require.NoError(t, os.MkdirAll(registry, 0o750))
+
+				sentinels := []string{
+					filepath.Join(victim, "go.mod"), filepath.Join(victim, "components.go"),
+					filepath.Join(victim, "v0.157.0.yaml"), filepath.Join(registry, "index.json"),
+					filepath.Join(registry, "components.json"), filepath.Join(root, "summary.md"),
+					filepath.Join(root, "schema.yaml"),
+				}
+				for _, sentinel := range sentinels {
+					writeFile(t, sentinel, "sentinel")
+				}
+
+				for _, destination := range [][]string{
+					{"--out", filepath.Join(root, "schema.yaml")},
+					{"--registry", registry, "--summary", filepath.Join(root, "summary.md"), "--retain", "1"},
+					{"--registry", filepath.Join(root, "new-registry")},
+				} {
+					args := append([]string{"--builder", builder, "--cache", cache}, destination...)
+					code, _, stderr := run(t, args...)
+					assert.Equal(t, schemagen.ExitFailure, code, "%s", stderr)
+					assert.Contains(t, stderr, "invalid", "%s", stderr)
+				}
+
+				assert.NoDirExists(t, cache)
+				assert.NoDirExists(t, filepath.Join(root, "new-registry"))
+
+				entries, err := os.ReadDir(registry)
+				require.NoError(t, err)
+				assert.Len(t, entries, 2)
+
+				for _, sentinel := range sentinels {
+					assert.Equal(t, "sentinel", readFile(t, sentinel), "%s was overwritten", sentinel)
+				}
+			})
+		}
+	}
 }
 
 // TestSkipsOneOfSeveral covers the other half: a manifest that cannot be read
@@ -268,6 +354,90 @@ replaces:
 	}
 }
 
+func TestCustomDecoderFieldTypes(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	receiver := module(t, root, "example.com/collector/receiver/customreceiver", map[string]string{
+		"metadata.yaml": "type: custom\nstatus:\n  class: receiver\n",
+		"config.go": "package customreceiver\n\n" +
+			"type JSONOptions struct { Enabled bool `mapstructure:\"enabled\"` }\n" +
+			"func (*JSONOptions) UnmarshalJSON(data []byte) error { return nil }\n" +
+			"type YAMLOptions struct { Enabled bool `mapstructure:\"enabled\"` }\n" +
+			"func (*YAMLOptions) UnmarshalYAML(unmarshal func(any) error) error { return nil }\n" +
+			"type JSONArray []bool\n" +
+			"func (*JSONArray) UnmarshalJSON(data []byte) error { return nil }\n" +
+			"type YAMLArray [2]bool\n" +
+			"func (*YAMLArray) UnmarshalYAML(unmarshal func(any) error) error { return nil }\n" +
+			"type Level int32\n" +
+			"func (*Level) UnmarshalText(text []byte) error { return nil }\n" +
+			"type Config struct {\n" +
+			"\tJSONOptions JSONOptions `mapstructure:\"json_options\"`\n" +
+			"\tYAMLOptions *YAMLOptions `mapstructure:\"yaml_options\"`\n" +
+			"\tJSONArray JSONArray `mapstructure:\"json_array\"`\n" +
+			"\tYAMLArray YAMLArray `mapstructure:\"yaml_array\"`\n" +
+			"\tLevel Level `mapstructure:\"level\"`\n}\n",
+	})
+
+	manifest := filepath.Join(root, "manifest.yaml")
+	writeFile(t, manifest, fmt.Sprintf(`
+dist:
+  name: custom
+  otelcol_version: 0.157.0
+receivers:
+  - gomod: example.com/collector/receiver/customreceiver v0.0.0
+replaces:
+  - example.com/collector/receiver/customreceiver => %s
+`, receiver))
+
+	code, stdout, stderr := run(t, "--builder", manifest, "--cache", t.TempDir())
+	require.Equal(t, schemagen.ExitOK, code, "run failed: %s", stderr)
+
+	sch, err := schema.Read(strings.NewReader(stdout))
+	require.NoError(t, err)
+
+	fields := sch.Components[config.KindReceiver]["custom"].Fields
+	require.NotNil(t, fields)
+
+	tests := []struct {
+		name     string
+		wantType string
+		value    string
+	}{
+		{name: "json_options", wantType: "map", value: "{enabled: true}"},
+		{name: "yaml_options", wantType: "map", value: "{enabled: true}"},
+		{name: "json_array", wantType: "", value: "[true, false]"},
+		{name: "yaml_array", wantType: "", value: "[true, false]"},
+		{name: "level", wantType: "string", value: "detailed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			field := fields.Children[tt.name]
+			require.NotNil(t, field)
+			assert.Equal(t, tt.wantType, field.Type)
+			found, err := ruletest.RunWith(invalidvalue.New(),
+				fmt.Sprintf("receivers:\n  custom:\n    %s: %s\n", tt.name, tt.value), ruletest.Options{Schema: sch})
+			require.NoError(t, err)
+			assert.Empty(t, found)
+		})
+	}
+
+	found, err := ruletest.RunWith(invalidvalue.New(), `
+receivers:
+  custom:
+    json_options: {enabled: wrong}
+    yaml_options: {enabled: wrong}
+    level: 2
+`, ruletest.Options{Schema: sch})
+	require.NoError(t, err)
+	require.Len(t, found, 3)
+	assert.Equal(t, "receivers.custom.json_options.enabled", found[0].Path)
+	assert.Equal(t, "receivers.custom.yaml_options.enabled", found[1].Path)
+	assert.Equal(t, "receivers.custom.level", found[2].Path)
+}
+
 // TestTextualType covers a setting whose Go type is a number but whose config
 // spelling is a word: configtelemetry.Level is an int32 with an UnmarshalText
 // method, and the debug exporter's "verbosity: detailed" is not an integer.
@@ -347,6 +517,8 @@ replaces:
 	code, stdout, stderr := run(t, "--builder", path, "--cache", t.TempDir())
 
 	require.Equal(t, schemagen.ExitOK, code, "run failed: %s", stderr)
+	assert.Contains(t, stdout, "modified: true", "a local confmap replacement must not inherit release defaults")
+	assert.Contains(t, stdout, "incomplete: true", "component-only resolution must not claim the full Collector graph")
 	assert.Contains(t, stdout, "root_path:", "the settings that did resolve were dropped")
 	assert.Contains(t, stdout, "open: true", "a partly resolved component was closed over half its settings")
 }
@@ -861,4 +1033,32 @@ func TestPrintVersionNeedsAManifest(t *testing.T) {
 	assert.Equal(t, schemagen.ExitUsage, code)
 	assert.Contains(t, stderr, schemagen.ErrNoManifests.Error())
 	assert.Contains(t, stderr, "Usage:")
+}
+
+func TestPrintVersionWithFS(t *testing.T) {
+	t.Parallel()
+
+	fsys := afero.NewMemMapFs()
+	path := filepath.Join(t.TempDir(), "manifest.yaml")
+	require.NoError(t, fsys.MkdirAll(filepath.Dir(path), 0o750))
+
+	body := "dist:\n  name: custom\n  version: 0.157.0\n" +
+		"receivers:\n  - gomod: example.com/receiver v0.0.0\n"
+	require.NoError(t, afero.WriteFile(fsys, path, []byte(body), 0o600))
+
+	var stdout bytes.Buffer
+
+	cmd := schemagen.NewCommandWithFS(fsys)
+	cmd.SetArgs([]string{"print-version", "--builder", path})
+	cmd.SetOut(&stdout)
+	require.NoError(t, cmd.Execute())
+	assert.Equal(t, "custom\tv0.157.0\n", stdout.String())
+
+	// A file on disk must not be visible through the injected filesystem.
+	diskPath := singleComponentManifest(t, t.TempDir())
+	cmd = schemagen.NewCommandWithFS(fsys)
+	cmd.SetArgs([]string{"print-version", "--builder", diskPath})
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	require.ErrorIs(t, cmd.Execute(), os.ErrNotExist)
 }

@@ -3,14 +3,10 @@ package rule
 import (
 	"regexp"
 
-	"github.com/samber/lo"
-	"github.com/samber/mo"
 	"gopkg.in/yaml.v3"
 )
 
-// BoolTag is the tag yaml.v3 resolves a boolean scalar to. A setting is only
-// read as one when the document actually wrote a boolean, so the string
-// "false" is not mistaken for the value.
+// BoolTag identifies a YAML boolean or a quoted boolean converted by DecodeScalar.
 const BoolTag = "!!bool"
 
 // mappingStride is the step between keys in a yaml.Node mapping, whose Content
@@ -48,26 +44,27 @@ func MapEntries(n *yaml.Node, path string) []MapEntry {
 // has. What counts as a usable value is the caller's business: an expansion is
 // nothing to a rule resolving a name, and still worth reading to one asking
 // which address a component listens on.
-func ChildNode(n *yaml.Node, key string) mo.Option[*yaml.Node] {
+func ChildNode(n *yaml.Node, key string) (*yaml.Node, bool) {
 	n = ResolveAlias(n)
 	if n == nil || n.Kind != yaml.MappingNode {
-		return mo.None[*yaml.Node]()
+		return nil, false
 	}
 
-	e, found := lo.Find(MapEntries(n, ""), func(e MapEntry) bool { return e.Key == key })
-	if !found {
-		return mo.None[*yaml.Node]()
+	for _, e := range MapEntries(n, "") {
+		if e.Key == key {
+			return e.Node, true
+		}
 	}
 
-	return mo.Some(e.Node)
+	return nil, false
 }
 
 // ScalarChild returns the named scalar of a mapping, when it holds a name
 // worth resolving.
-func ScalarChild(n *yaml.Node, key string) mo.Option[*yaml.Node] {
-	val, written := ChildNode(n, key).Get()
+func ScalarChild(n *yaml.Node, key string) (*yaml.Node, bool) {
+	val, written := ChildNode(n, key)
 	if !written {
-		return mo.None[*yaml.Node]()
+		return nil, false
 	}
 
 	return ScalarName(val)
@@ -76,13 +73,13 @@ func ScalarChild(n *yaml.Node, key string) mo.Option[*yaml.Node] {
 // ScalarName returns the node when it holds a name worth resolving. An empty
 // value is not a reference, and one built from a confmap expansion is only
 // known once the collector starts.
-func ScalarName(n *yaml.Node) mo.Option[*yaml.Node] {
+func ScalarName(n *yaml.Node) (*yaml.Node, bool) {
 	n = ResolveAlias(n)
 	if n == nil || n.Kind != yaml.ScalarNode || n.Value == "" || HasExpansion(n.Value) {
-		return mo.None[*yaml.Node]()
+		return nil, false
 	}
 
-	return mo.Some(n)
+	return n, true
 }
 
 // WalkSettings visits every mapping inside a component's settings, together
@@ -168,19 +165,38 @@ func IndexPath(path string, i int) string {
 	return path + "[" + Itoa(i) + "]"
 }
 
-var (
-	durationRE  = regexp.MustCompile(`^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$`)
-	expansionRE = regexp.MustCompile(`\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)
-)
+var expansionRE = regexp.MustCompile(`\$\$|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)
+
+// IsExpansion reports a scalar whose value or shape is supplied at runtime.
+func IsExpansion(n *yaml.Node) bool {
+	n = ResolveAlias(n)
+
+	return n != nil && n.Kind == yaml.ScalarNode && HasExpansion(n.Value)
+}
 
 // HasExpansion reports whether a scalar contains a confmap expansion such as
-// ${env:HOST}, whose value is unknown until the collector starts.
-func HasExpansion(s string) bool { return expansionRE.MatchString(s) }
+// ${env:HOST}, whose value is unknown until the collector starts. Dollar pairs
+// escape an expansion and must be consumed before matching its opening dollar.
+func HasExpansion(s string) bool {
+	for _, match := range expansionRE.FindAllString(s, -1) {
+		if match != "$$" {
+			return true
+		}
+	}
+
+	return false
+}
 
 // MaskExpansions replaces every confmap expansion in a value with mask, so text
 // carrying one can be taken apart by something that cannot see past it. The
 // mask stands for a value nobody knows yet rather than for nothing, which is
 // what lets the caller tell "the port is an expansion" from "there is no port".
 func MaskExpansions(value, mask string) string {
-	return expansionRE.ReplaceAllString(value, mask)
+	return expansionRE.ReplaceAllStringFunc(value, func(match string) string {
+		if match == "$$" {
+			return match
+		}
+
+		return mask
+	})
 }

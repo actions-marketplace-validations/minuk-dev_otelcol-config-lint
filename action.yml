@@ -10,10 +10,8 @@ branding:
   icon: check-square
   color: purple
 
-# Every input maps onto the "run" flag of the same name, which in turn mirrors a
-# key of the settings file, so there is nothing new to learn: the CLI
-# documentation is the action documentation. Only --concurrency and --no-color
-# are left out; a runner has nothing to gain from either.
+# Most inputs map onto the "run" flag of the same name, which in turn mirrors a
+# key of the settings file. file-summary is specific to GitHub Actions.
 inputs:
   files:
     description: >-
@@ -24,13 +22,13 @@ inputs:
     required: false
     default: "."
   collector-version:
-    description: Collector release to validate against, e.g. v0.157.0.
+    description: Collector release to validate against, e.g. v0.157.0. Blank inherits the settings file.
     required: false
-    default: latest
+    default: ""
   distribution:
-    description: "Collector distribution to validate against: core, contrib, k8s or otlp."
+    description: "Collector distribution to validate against: core, contrib, k8s or otlp. Blank inherits the settings file."
     required: false
-    default: contrib
+    default: ""
   schema-location:
     description: >-
       Where to find schemas: a registry directory or URL, a {{.Version}} /
@@ -39,21 +37,25 @@ inputs:
     required: false
     default: ""
   strict:
-    description: Report unknown component settings as errors.
+    description: Report unknown component settings as errors. Blank inherits the settings file.
     required: false
-    default: "false"
+    default: ""
+  embedded:
+    description: Lint collector configs in Kubernetes ConfigMap data blocks. Blank inherits the settings file.
+    required: false
+    default: ""
   ignore-missing-schemas:
-    description: Do not fail on components missing from the schema.
+    description: Do not fail on components missing from the schema. Blank inherits the settings file.
     required: false
-    default: "false"
+    default: ""
   min-severity:
-    description: "Lowest severity to report: error, warning or info."
+    description: "Lowest severity to report: error, warning or info. Blank inherits the settings file."
     required: false
-    default: info
+    default: ""
   fail-on:
-    description: "Severity that makes a file invalid: error, warning or info."
+    description: "Severity that makes a file invalid: error, warning or info. Blank inherits the settings file."
     required: false
-    default: error
+    default: ""
   default:
     description: "Rule set to start from: all (the default) or none."
     required: false
@@ -93,14 +95,18 @@ inputs:
     description: Append a count of the outcomes to the output.
     required: false
     default: "true"
+  file-summary:
+    description: List each checked file and its status in the job summary.
+    required: false
+    default: "false"
   verbose:
-    description: Also report the files that passed.
+    description: Also report the files that passed. Blank inherits the settings file.
     required: false
-    default: "false"
+    default: ""
   exit-on-error:
-    description: Stop at the first file that fails.
+    description: Stop at the first file that fails. Blank inherits the settings file.
     required: false
-    default: "false"
+    default: ""
 
 outputs:
   exit-code:
@@ -131,6 +137,7 @@ runs:
     - --distribution=${{ inputs.distribution }}
     - --schema-location=${{ inputs.schema-location }}
     - --strict=${{ inputs.strict }}
+    - --embedded=${{ inputs.embedded }}
     - --ignore-missing-schemas=${{ inputs.ignore-missing-schemas }}
     - --min-severity=${{ inputs.min-severity }}
     - --fail-on=${{ inputs.fail-on }}
@@ -143,5 +150,6 @@ runs:
     - --config=${{ inputs.config }}
     - --no-config=${{ inputs.no-config }}
     - --summary=${{ inputs.summary }}
+    - --file-summary=${{ inputs.file-summary }}
     - --verbose=${{ inputs.verbose }}
     - --exit-on-error=${{ inputs.exit-on-error }}

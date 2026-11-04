@@ -21,6 +21,7 @@ type wrongNodeType struct{ rule.Base }
 func (r wrongNodeType) Check(ctx *rule.Context) {
 	r.checkSections(ctx)
 	r.checkService(ctx)
+	r.checkTelemetry(ctx)
 }
 
 // checkSections reports a component section written as anything but a mapping
@@ -28,7 +29,7 @@ func (r wrongNodeType) Check(ctx *rule.Context) {
 func (r wrongNodeType) checkSections(ctx *rule.Context) {
 	for _, kind := range config.Kinds() {
 		sec := ctx.File.Sections[kind]
-		if sec == nil || rule.IsNull(sec.Node) || sec.Node.Kind == yaml.MappingNode {
+		if sec == nil || rule.IsNull(sec.Node) || rule.IsExpansion(sec.Node) || sec.Node.Kind == yaml.MappingNode {
 			continue
 		}
 
@@ -44,12 +45,15 @@ func (r wrongNodeType) checkSections(ctx *rule.Context) {
 // else: the extensions it enables, and the three slots of every pipeline.
 func (r wrongNodeType) checkService(ctx *rule.Context) {
 	svc := ctx.File.Service
-	if svc.ExtensionsNode != nil && !rule.IsNull(svc.ExtensionsNode) && svc.ExtensionsNode.Kind != yaml.SequenceNode {
+	if !rule.IsNull(svc.ExtensionsNode) && !rule.IsExpansion(svc.ExtensionsNode) &&
+		svc.ExtensionsNode.Kind != yaml.SequenceNode {
 		ctx.Report(rule.Finding{
 			Node: svc.ExtensionsNode, Path: "service.extensions",
 			Message: "service.extensions must be a list, got " + rule.NodeKind(svc.ExtensionsNode),
 		})
 	}
+
+	r.checkReferenceItems(ctx, svc.ExtensionsNode, "service.extensions")
 
 	for _, p := range svc.Pipelines {
 		for _, slot := range []struct {
@@ -60,15 +64,61 @@ func (r wrongNodeType) checkService(ctx *rule.Context) {
 			{"processors", p.ProcessorsNode},
 			{"exporters", p.ExportersNode},
 		} {
-			if slot.node == nil || rule.IsNull(slot.node) || slot.node.Kind == yaml.SequenceNode {
+			path := "service.pipelines." + p.Key + "." + slot.name
+			r.checkReferenceItems(ctx, slot.node, path)
+
+			if rule.IsNull(slot.node) || rule.IsExpansion(slot.node) || slot.node.Kind == yaml.SequenceNode {
 				continue
 			}
 
 			ctx.Report(rule.Finding{
-				Node: slot.node, Path: "service.pipelines." + p.Key + "." + slot.name,
+				Node: slot.node, Path: path,
 				Message: slot.name + " must be a list, got " + rule.NodeKind(slot.node),
 				Hint:    "write it as a YAML sequence, e.g. " + slot.name + ": [otlp]",
 			})
 		}
 	}
+}
+
+func (r wrongNodeType) checkReferenceItems(ctx *rule.Context, n *yaml.Node, path string) {
+	if n == nil || n.Kind != yaml.SequenceNode {
+		return
+	}
+
+	for i, item := range n.Content {
+		if item.Kind == yaml.ScalarNode {
+			continue
+		}
+
+		ctx.Report(rule.Finding{
+			Node: item, Path: rule.IndexPath(path, i),
+			Message: "component reference must be a scalar, got " + rule.NodeKind(item),
+		})
+	}
+}
+
+func (r wrongNodeType) checkTelemetry(ctx *rule.Context) {
+	tel := ctx.File.Service.Telemetry
+	r.checkMapping(ctx, tel.Node, "service.telemetry")
+
+	for _, signal := range []*config.TelemetrySignal{tel.Logs, tel.Metrics, tel.Traces} {
+		if signal != nil {
+			r.checkMapping(ctx, signal.Node, "service.telemetry."+signal.Key)
+		}
+	}
+}
+
+func (r wrongNodeType) checkMapping(ctx *rule.Context, node *yaml.Node, path string) {
+	if rule.IsNull(node) || node.Kind == yaml.MappingNode {
+		return
+	}
+
+	if node.Kind == yaml.ScalarNode && rule.HasExpansion(node.Value) {
+		return
+	}
+
+	ctx.Report(rule.Finding{
+		Node: node, Path: path,
+		Message: path + " must be a mapping, got " + rule.NodeKind(node),
+	})
 }

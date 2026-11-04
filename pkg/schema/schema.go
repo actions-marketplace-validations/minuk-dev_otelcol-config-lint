@@ -26,7 +26,9 @@ type Schema struct {
 	// the one place a distribution is recorded: the components below carry no
 	// membership of their own, since a second answer could only disagree.
 	Distribution string `json:"distribution,omitempty" yaml:"distribution,omitempty"`
-	GeneratedAt  string `json:"generatedAt,omitempty"  yaml:"generatedAt,omitempty"`
+	// Decoder is nil for legacy schemas that only identify an upstream release.
+	Decoder     *Decoder `json:"decoder,omitempty"     yaml:"decoder,omitempty"`
+	GeneratedAt string   `json:"generatedAt,omitempty" yaml:"generatedAt,omitempty"`
 	// Sources maps each upstream repository harvested to the module it was
 	// generated from. It is provenance, not distribution membership: both
 	// repositories are read whichever distribution is being written.
@@ -251,6 +253,12 @@ var errEmptySchema = errors.New("decode schema: empty document")
 // document, where everything after the first would otherwise be dropped.
 var errMultiDocumentSchema = errors.New("decode schema: more than one document")
 
+// errNullComponent reports an inventory entry with no component definition.
+var errNullComponent = errors.New("component must not be null")
+
+// errNullField reports a child entry with no field definition.
+var errNullField = errors.New("field must not be null")
+
 // Format is a schema serialisation format.
 type Format string
 
@@ -263,6 +271,8 @@ const (
 
 // Read decodes a schema. Both YAML and JSON are accepted, since JSON is valid
 // YAML, so callers do not have to know which form they were handed.
+// An empty component inventory is accepted for structural-only library use;
+// callers that require component validation must check Count before linting.
 func Read(r io.Reader) (*Schema, error) {
 	var c Schema
 
@@ -296,10 +306,21 @@ func Read(r io.Reader) (*Schema, error) {
 		c.Components = map[config.Kind]map[string]*Component{}
 	}
 
-	for _, byType := range c.Components {
+	for kind, byType := range c.Components {
 		for typ, comp := range byType {
+			if comp == nil {
+				return nil, fmt.Errorf("decode schema: %s.%s: %w", kind, typ, errNullComponent)
+			}
+
 			if comp.Type == "" {
 				comp.Type = typ
+			}
+
+			if comp.Fields != nil {
+				err := validateField(comp.Fields, string(kind)+"."+typ+".fields")
+				if err != nil {
+					return nil, fmt.Errorf("decode schema: %w", err)
+				}
 			}
 		}
 	}
@@ -307,13 +328,33 @@ func Read(r io.Reader) (*Schema, error) {
 	return &c, nil
 }
 
-// ReadFile decodes a schema from a file on disk.
-func ReadFile(path string) (*Schema, error) {
-	return readFile(afero.NewOsFs(), path)
+func validateField(field *Field, path string) error {
+	if field == nil {
+		return fmt.Errorf("%s: %w", path, errNullField)
+	}
+
+	for name, child := range field.Children {
+		err := validateField(child, path+"."+name)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-// readFile decodes a schema from a file on the given filesystem.
-func readFile(fsys afero.Fs, path string) (*Schema, error) {
+// ReadFile decodes a schema from a file on disk.
+func ReadFile(path string) (*Schema, error) {
+	return ReadFileFS(afero.NewOsFs(), path)
+}
+
+// ReadFileFS decodes a schema from a file on the given filesystem.
+// A nil filesystem uses the real disk.
+func ReadFileFS(fsys afero.Fs, path string) (*Schema, error) {
+	if fsys == nil {
+		fsys = afero.NewOsFs()
+	}
+
 	f, err := fsys.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open schema: %w", err)

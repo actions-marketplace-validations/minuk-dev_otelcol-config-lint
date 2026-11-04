@@ -10,7 +10,6 @@ import (
 	"io"
 	"path/filepath"
 
-	"github.com/samber/mo"
 	"github.com/spf13/afero"
 	"gopkg.in/yaml.v3"
 )
@@ -18,6 +17,8 @@ import (
 // ErrUnknownVersion reports a settings file written against a schema this
 // release does not know.
 var ErrUnknownVersion = errors.New("unknown settings version")
+
+var errMultiDocumentSettings = errors.New("settings must contain no more than one document")
 
 // Version is the schema the settings file is read as. A file may state it to be
 // explicit; a file that does not is read as this version. It exists so a later
@@ -100,6 +101,8 @@ type RunBlock struct {
 	AllowNearestFallback *bool `yaml:"allowNearestFallback"`
 	// Strict reports unknown component settings as errors.
 	Strict *bool `yaml:"strict"`
+	// Embedded checks collector configs in Kubernetes ConfigMap data blocks.
+	Embedded *bool `yaml:"embedded"`
 	// IgnoreMissingSchemas keeps components absent from the schema from
 	// failing the run, for a custom distribution.
 	IgnoreMissingSchemas *bool `yaml:"ignoreMissingSchemas"`
@@ -115,6 +118,9 @@ type RunBlock struct {
 // RulesBlock is the "rules" block: which rules run, at what level, and with
 // what settings of their own.
 type RulesBlock struct {
+	// Overrides applies the first matching filesystem-path rule exception.
+	Overrides []RuleOverride `yaml:"overrides"`
+
 	// Default is the set to start from: "all", every registered rule, or
 	// "none", which runs only what enable names.
 	Default string `yaml:"default"`
@@ -132,6 +138,13 @@ type RulesBlock struct {
 	Settings map[string]yaml.Node `yaml:"settings"`
 }
 
+// RuleOverride changes rule policy for matching files without enabling disabled rules.
+type RuleOverride struct {
+	Paths    []string          `yaml:"paths"`
+	Disable  []string          `yaml:"disable"`
+	Severity map[string]string `yaml:"severity"`
+}
+
 // Kubernetes is the "kubernetes" block of a settings file: what the pods these
 // configs run in look like, which is what the sizing rules check against.
 //
@@ -141,8 +154,10 @@ type RulesBlock struct {
 // path-to-limits table belongs in a file.
 type Kubernetes struct {
 	// Enabled says the configs run in Kubernetes. When it is not set, writing
-	// either memory number is taken to mean the same thing.
+	// hostNetwork or either memory number is taken to mean the same thing.
 	Enabled *bool `yaml:"enabled"`
+	// HostNetwork distinguishes pod-local listeners from node listeners.
+	HostNetwork *bool `yaml:"hostNetwork"`
 	// MemoryRequest and MemoryLimit are the container's resources, written as
 	// a Kubernetes quantity such as "512Mi".
 	MemoryRequest string `yaml:"memoryRequest"`
@@ -154,7 +169,7 @@ type Kubernetes struct {
 // written reports whether the block says anything at all, which is how the
 // flat first-release form knows it has nothing to fold in.
 func (k Kubernetes) written() bool {
-	return k.Enabled != nil || k.MemoryRequest != "" || k.MemoryLimit != "" || len(k.Overrides) > 0
+	return k.Enabled != nil || k.HostNetwork != nil || k.MemoryRequest != "" || k.MemoryLimit != "" || len(k.Overrides) > 0
 }
 
 // KubernetesOverride is one path-matched entry of the kubernetes block. It
@@ -165,6 +180,7 @@ type KubernetesOverride struct {
 	// base name, exactly as the exclude patterns are.
 	Paths         []string `yaml:"paths"`
 	Enabled       *bool    `yaml:"enabled"`
+	HostNetwork   *bool    `yaml:"hostNetwork"`
 	MemoryRequest string   `yaml:"memoryRequest"`
 	MemoryLimit   string   `yaml:"memoryLimit"`
 }
@@ -310,8 +326,8 @@ func (s *File) foldLists() []string {
 	return used
 }
 
-// Parse decodes a settings file, rejecting keys it does not know: a misspelled
-// key is policy that silently did not apply.
+// Parse decodes a single settings document, rejecting keys it does not know:
+// a misspelled key is policy that silently did not apply.
 func Parse(src []byte) (*File, error) {
 	var s File
 
@@ -320,6 +336,17 @@ func Parse(src []byte) (*File, error) {
 
 	err := dec.Decode(&s)
 	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err //nolint:wrapcheck // the caller names the file
+	}
+
+	var extra yaml.Node
+
+	err = dec.Decode(&extra)
+	if err == nil {
+		return nil, errMultiDocumentSettings
+	}
+
+	if !errors.Is(err, io.EOF) {
 		return nil, err //nolint:wrapcheck // the caller names the file
 	}
 
@@ -392,16 +419,16 @@ type Fold struct {
 
 // Str takes a written value, an empty one meaning the file said nothing.
 func (f Fold) Str(name string, dst *string, v string) {
-	if !f.Changed(name) {
-		*dst = mo.EmptyableToOption(v).OrElse(*dst)
+	if !f.Changed(name) && v != "" {
+		*dst = v
 	}
 }
 
 // Bool takes a set value, a nil one meaning the file said nothing: false is a
 // thing to say about a flag whose default is true.
 func (f Fold) Bool(name string, dst *bool, v *bool) {
-	if !f.Changed(name) {
-		*dst = mo.PointerToOption(v).OrElse(*dst)
+	if !f.Changed(name) && v != nil {
+		*dst = *v
 	}
 }
 

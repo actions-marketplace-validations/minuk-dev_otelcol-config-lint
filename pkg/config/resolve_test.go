@@ -2,7 +2,6 @@ package config_test
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -107,6 +106,71 @@ processors:
 		settings(t, f, "memory_limiter"))
 }
 
+func TestAliasMappingKeys(t *testing.T) {
+	t.Parallel()
+
+	f := parse(t, "receivers:\n  &component otlp: {}\nexporters:\n  *component : {endpoint: backend:4317}\n")
+	component, found := f.Component(config.KindExporter, config.ParseID("otlp"))
+	require.True(t, found)
+	assert.Equal(t, "otlp", component.KeyNode.Value)
+	assert.Equal(t, 2, f.Pos(component.KeyNode).Line, "resolved keys retain the anchor's source position")
+}
+
+func TestAliasKeysAndMerges(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, source string
+	}{
+		{name: "local alias overrides merge", source: `processors:
+  batch/base: &base
+    &setting timeout: 1s
+  batch:
+    <<: *base
+    *setting : 5s
+`},
+		{name: "alias in merged source", source: `processors:
+  batch/key:
+    &setting timeout: 1s
+  batch/base: &base
+    *setting : 5s
+  batch:
+    <<: *base
+`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := parse(t, tt.source)
+			assert.Equal(t, map[string]string{"timeout": "5s"}, settings(t, f, "batch"))
+			assert.Empty(t, f.DuplicateKeys)
+		})
+	}
+}
+
+func TestDuplicateAliasKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, source string
+	}{
+		{name: "literal then alias", source: "    &setting timeout: 1s\n    *setting : 5s\n"},
+		{name: "alias then literal", source: "    *setting : 1s\n    timeout: 5s\n"},
+		{name: "different aliases", source: "    *setting : 1s\n    *other : 5s\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := parse(t, "processors:\n  batch/base:\n    key: &setting timeout\n"+
+				"    other: &other timeout\n  batch:\n"+tt.source)
+			require.Len(t, f.DuplicateKeys, 1)
+			assert.Equal(t, "timeout", f.DuplicateKeys[0].Key)
+			assert.Equal(t, "processors.batch.timeout", f.DuplicateKeys[0].Path)
+			assert.Equal(t, 7, f.Pos(f.DuplicateKeys[0].KeyNode).Line)
+		})
+	}
+}
+
 // TestASequenceOfMergesAppliesTheFirstThatCarriesTheKey pins the order
 // yaml.v3 applies "<<: [*a, *b]" in.
 func TestASequenceOfMergesAppliesTheFirstThatCarriesTheKey(t *testing.T) {
@@ -180,36 +244,56 @@ func TestAQuotedMergeKeyIsAKeyOfItsOwn(t *testing.T) {
 		"a quoted key is not a merge key")
 }
 
-// TestAMergeOfSomethingThatIsNotAMappingIsLeftAlone pins the one merge the
-// collector cannot load either: yaml.v3 fails the decode outright, so dropping
-// the key quietly would leave nothing for a rule to report.
-func TestAMergeOfSomethingThatIsNotAMappingIsLeftAlone(t *testing.T) {
+func TestInvalidMergeOperandsAreRejected(t *testing.T) {
 	t.Parallel()
 
-	f := parse(t, "processors:\n  batch:\n    <<: hello\n")
+	for _, tt := range []struct{ name, value string }{
+		{"scalar", "hello"},
+		{"null", "null"},
+		{"mixed sequence", "[{}, hello]"},
+		{"nested sequence", "[[{}]]"},
+		{"aliased scalar", "*scalar"},
+		{"aliased invalid sequence", "*sequence"},
+		{"scalar alias in sequence", "[{}, *scalar]"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	assert.Contains(t, settings(t, f, "batch"), "<<")
+			src := "scalar: &scalar hello\nsequence: &sequence [{}, hello]\nheaders: {<<: " + tt.value + "}\n"
+			f, err := config.Parse("bad.yaml", []byte(src))
+
+			var syn *config.SyntaxError
+
+			require.ErrorAs(t, err, &syn)
+			assert.Nil(t, f)
+			assert.Equal(t, "bad.yaml", syn.Path)
+			assert.Equal(t, 3, syn.Line)
+			assert.Positive(t, syn.Column)
+			assert.Contains(t, syn.Msg, "map merge requires map or sequence of maps")
+		})
+	}
 }
 
-// TestACyclicAliasDoesNotHang pins that a document yaml.v3 refuses to decode
-// still parses: the node tree comes back with the loop in it, and a linter
-// that recursed into it would never report anything at all.
-func TestACyclicAliasDoesNotHang(t *testing.T) {
+func TestCyclicAliasesAreRejected(t *testing.T) {
 	t.Parallel()
 
-	done := make(chan struct{})
+	for name, value := range map[string]string{
+		"mapping":  "nested: *loop",
+		"sequence": "nested: [*loop]",
+		"merge":    "<<: *loop",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	go func() {
-		defer close(done)
+			f, err := config.Parse("test.yaml", []byte("processors:\n  batch: &loop\n    "+value+"\n"))
 
-		_, err := config.Parse("test.yaml", []byte("processors:\n  batch: &loop\n    nested: [*loop]\n"))
-		assert.NoError(t, err)
-	}()
+			var syn *config.SyntaxError
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("parsing an anchor that contains itself did not finish")
+			require.ErrorAs(t, err, &syn)
+			assert.Nil(t, f)
+			assert.Equal(t, 3, syn.Line)
+			assert.Contains(t, syn.Msg, "cyclic YAML alias")
+		})
 	}
 }
 

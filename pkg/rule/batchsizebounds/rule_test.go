@@ -9,6 +9,7 @@ import (
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/batchsizebounds"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/ruletest"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
 )
 
 // check runs the rule over src, which every test in this package starts from.
@@ -43,6 +44,18 @@ func TestBatchSizeBounds(t *testing.T) {
 		settings string
 		want     string // a phrase the finding has to carry
 	}{
+		"fractional values compare after truncation": {
+			settings: "    send_batch_size: 100.9\n    send_batch_max_size: 99.9",
+			want:     "sets send_batch_max_size to 99 and send_batch_size to 100",
+		},
+		"negative fraction cannot decode into uint32": {
+			settings: "    send_batch_size: -0.9",
+			want:     "sets send_batch_size to -0.9, which the field cannot hold",
+		},
+		"floating point uint32 overflow": {
+			settings: "    send_batch_size: 4294967296.0",
+			want:     "which the field cannot hold",
+		},
 		"a cap below the default size": {
 			settings: "    send_batch_max_size: 1000",
 			want:     "send_batch_max_size must be greater or equal to send_batch_size",
@@ -223,4 +236,92 @@ func TestBatchSizeBoundsPointsAtTheDuplicate(t *testing.T) {
 	found := check(t, src)
 	require.Lenf(t, found, 1, "want one finding about the repeated key, got %+v", found)
 	assert.Equal(t, "processors.batch.metadata_keys[2]", found[0].Path)
+}
+
+func TestBatchSizeBoundsDistinguishesNullFromMissing(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		settings string
+		invalid  bool
+	}{
+		{name: "missing uses 8192", settings: "", invalid: true},
+		{name: "null uses zero", settings: "    send_batch_size: null\n", invalid: false},
+		{name: "shorthand uses zero", settings: "    send_batch_size: ~\n", invalid: false},
+		{name: "empty uses zero", settings: "    send_batch_size:\n", invalid: false},
+		{name: "explicit zero", settings: "    send_batch_size: 0\n", invalid: false},
+		{name: "runtime expansion stays unknown", settings: "    send_batch_size: ${env:SIZE}\n", invalid: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			found := check(t, batcher("batch", tt.settings+"    send_batch_max_size: 1000"))
+			if tt.invalid {
+				require.Len(t, found, 1)
+				assert.Contains(t, found[0].Message, "below the default send_batch_size of 8192")
+
+				return
+			}
+
+			assert.Empty(t, found)
+		})
+	}
+}
+
+func TestNullBatchSizeUsesVersionedDefault(t *testing.T) {
+	t.Parallel()
+
+	for _, version := range []string{"v0.101.0", "v0.126.0", "v0.127.0", "v0.153.0", "", "latest"} {
+		for _, value := range []string{"null", "~", "", "0", "${env:BATCH_SIZE}"} {
+			t.Run(version+"/"+value, func(t *testing.T) {
+				t.Parallel()
+
+				sch := ruletest.Schema()
+				sch.CollectorVersion = version
+				found, err := ruletest.RunWith(batchsizebounds.New(), batcher("batch/traces",
+					"    send_batch_size: "+value+"\n    send_batch_max_size: 512"), ruletest.Options{Schema: sch})
+				require.NoError(t, err)
+
+				if (version == "v0.101.0" || version == "v0.126.0") && value != "0" && value != "${env:BATCH_SIZE}" {
+					require.Len(t, found, 1)
+					assert.Contains(t, found[0].Message, "below the default send_batch_size of 8192")
+					assert.Equal(t, "processors.batch/traces.send_batch_max_size", found[0].Path)
+				} else {
+					assert.Empty(t, found)
+				}
+			})
+		}
+	}
+}
+
+func TestNullBatchSizeUsesDecoderProvenance(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, version string
+		decoder       *schema.Decoder
+		count         int
+	}{
+		{"custom suffix is unknown", "v0.127.0-custom", nil, 0},
+		{"development is unknown", "dev", nil, 0},
+		{"old decoder in new distribution", "v1.0.0",
+			&schema.Decoder{ConfmapVersion: "v1.32.0", Modified: false}, 1},
+		{"new decoder in old distribution", "v0.101.0",
+			&schema.Decoder{ConfmapVersion: "v1.33.0", Modified: false}, 0},
+		{"local replacement is unknown", "v0.101.0",
+			&schema.Decoder{ConfmapVersion: "v0.101.0", Modified: true}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sch := ruletest.Schema()
+			sch.CollectorVersion, sch.Distribution, sch.Decoder = tt.version, "custom", tt.decoder
+			found, err := ruletest.RunWith(batchsizebounds.New(),
+				batcher("batch", "    send_batch_size: null\n    send_batch_max_size: 512"),
+				ruletest.Options{Schema: sch})
+			require.NoError(t, err)
+			assert.Len(t, found, tt.count)
+		})
+	}
 }

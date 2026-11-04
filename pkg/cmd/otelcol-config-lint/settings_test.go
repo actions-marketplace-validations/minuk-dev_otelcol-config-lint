@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/settings"
 )
 
@@ -28,7 +28,20 @@ func absSchemas(t *testing.T) string {
 func firedRules(t *testing.T, out string) []string {
 	t.Helper()
 
-	return lo.Uniq(lo.Flatten(lo.Values(rulesFired(t, out))))
+	seen := sets.New[string]()
+
+	var rules []string
+
+	for _, found := range rulesFired(t, out) {
+		for _, name := range found {
+			if !seen.Has(name) {
+				seen.Insert(name)
+				rules = append(rules, name)
+			}
+		}
+	}
+
+	return rules
 }
 
 // v0110Config uses the logging exporter, which v0.110.0 ships and v0.157.0 does
@@ -125,7 +138,6 @@ func TestOutputAcceptsABareFormat(t *testing.T) {
 	assert.Contains(t, out, `"filename"`, "a bare format should still select json")
 }
 
-//nolint:paralleltest // t.Chdir cannot be called from a parallel test
 func TestASettingsFileIsFoundInAParentDirectory(t *testing.T) {
 	schemas, dir := absSchemas(t), t.TempDir()
 	writeFile(t, filepath.Join(dir, ".otelcol-config-lint.yaml"),
@@ -142,8 +154,6 @@ func TestASettingsFileIsFoundInAParentDirectory(t *testing.T) {
 
 // TestTheSearchStopsAtTheRepositoryRoot keeps a run from picking up whatever
 // happens to sit above the project it is linting.
-//
-//nolint:paralleltest // t.Chdir cannot be called from a parallel test
 func TestTheSearchStopsAtTheRepositoryRoot(t *testing.T) {
 	schemas, dir := absSchemas(t), t.TempDir()
 	writeFile(t, filepath.Join(dir, ".otelcol-config-lint.yaml"), "run:\n  collectorVersion: v0.110.0\n")
@@ -158,7 +168,6 @@ func TestTheSearchStopsAtTheRepositoryRoot(t *testing.T) {
 	assert.Equal(t, 1, code, "a file above the repository must not apply:\n%s", out)
 }
 
-//nolint:paralleltest // t.Chdir cannot be called from a parallel test
 func TestTheYmlSpellingIsFoundToo(t *testing.T) {
 	schemas, dir := absSchemas(t), t.TempDir()
 	writeFile(t, filepath.Join(dir, ".otelcol-config-lint.yml"),
@@ -171,7 +180,6 @@ func TestTheYmlSpellingIsFoundToo(t *testing.T) {
 	assert.Equal(t, 0, code, "the .yml spelling should be read: %s%s", out, errOut)
 }
 
-//nolint:paralleltest // t.Chdir cannot be called from a parallel test
 func TestNoConfigIgnoresTheFileThatWouldBeFound(t *testing.T) {
 	schemas, dir := absSchemas(t), t.TempDir()
 	writeFile(t, filepath.Join(dir, ".otelcol-config-lint.yaml"),
@@ -257,12 +265,12 @@ func TestAnUnknownRuleSetIsAUsageError(t *testing.T) {
 func TestSettingsForARuleThatTakesNoneIsAUsageError(t *testing.T) {
 	t.Parallel()
 
-	path := writeSettings(t, "rules:\n  settings:\n    missing-batch:\n      timeout: 5s\n")
+	path := writeSettings(t, "rules:\n  settings:\n    insecure-tls:\n      timeout: 5s\n")
 
 	code, _, errOut := lint(t, "", "--config", path, badConfig)
 
 	assert.Equal(t, 2, code)
-	assert.Contains(t, errOut, "missing-batch")
+	assert.Contains(t, errOut, "insecure-tls")
 	assert.Contains(t, errOut, "takes no settings")
 }
 
@@ -301,6 +309,30 @@ func TestASettingsFileFromAnotherVersionIsReported(t *testing.T) {
 
 	assert.Equal(t, 2, code)
 	assert.Contains(t, errOut, settings.Version)
+}
+
+func TestTrailingSettingsDocumentsAreUsageErrors(t *testing.T) {
+	t.Parallel()
+
+	for name, trailing := range map[string]string{
+		"valid": "version: \"1\"\n", "empty": "", "malformed": "this is: [broken\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			path := writeSettings(t, "version: \"1\"\n---\n"+trailing)
+			code, _, errOut := lint(t, "", "--config", path, validConfig)
+
+			assert.Equal(t, 2, code)
+			assert.Contains(t, errOut, path)
+
+			if name == "malformed" {
+				assert.Contains(t, errOut, "yaml: line")
+			} else {
+				assert.Contains(t, errOut, "more than one document")
+			}
+		})
+	}
 }
 
 // TestConcurrencyKeepsItsOldShorthand guards the rename: -n was the whole flag
@@ -372,4 +404,227 @@ func TestListRulesHonoursTheRuleBlock(t *testing.T) {
 
 		assert.Contains(t, rest, "off", "%q should be listed as off under default: none", name)
 	}
+}
+
+func TestAlphaReportingSettings(t *testing.T) {
+	t.Parallel()
+
+	source := `receivers: {filelog: {}}
+exporters: {debug: {}}
+service:
+  pipelines:
+    logs: {receivers: [filelog], exporters: [debug]}
+`
+
+	for _, enabled := range []string{"true", "false"} {
+		t.Run(enabled, func(t *testing.T) {
+			t.Parallel()
+			path := writeSettings(t, "rules:\n  default: none\n  enable: [component-stability]\n"+
+				"  settings:\n    component-stability:\n      report_alpha: "+enabled+"\n")
+			code, out, errOut := lint(t, source, "--config", path, "-")
+			require.Equal(t, 0, code, errOut)
+			assert.Equal(t, enabled == "true", strings.Contains(out, "is alpha"), out)
+		})
+	}
+}
+
+func TestFileRuleOverridesReachCLI(t *testing.T) {
+	t.Parallel()
+	policy := writeSettings(t, `rules:
+  default: none
+  enable: [debug-exporter-verbosity]
+  overrides:
+    - paths: ["sink.yaml"]
+      disable: [debug-exporter-verbosity]
+`)
+	dir := t.TempDir()
+	sink := filepath.Join(dir, "sink.yaml")
+	other := filepath.Join(dir, "other.yaml")
+
+	const src = "exporters:\n  debug: {}\nservice:\n  pipelines:\n    logs:\n      exporters: [debug]\n"
+	writeFile(t, sink, src)
+	writeFile(t, other, src)
+	_, out, errOut := lint(t, "", "--config", policy, "--output", "json", sink, other)
+	require.Empty(t, errOut)
+	require.NotContains(t, rulesFired(t, out)["sink.yaml"], "debug-exporter-verbosity")
+	require.Contains(t, rulesFired(t, out)["other.yaml"], "debug-exporter-verbosity")
+	code, out, errOut := lint(t, "", "--config", policy, "--severity", "debug-exporter-verbosity=warning",
+		"--fail-on", "warning", sink)
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, out, "warning:")
+}
+
+func TestStdinKeepsGlobalPolicy(t *testing.T) {
+	t.Parallel()
+
+	policy := writeSettings(t, `rules:
+  default: none
+  enable: [service-required]
+  overrides:
+    - paths: ['*']
+      disable: [service-required]
+`)
+
+	const source = "receivers: {}\n"
+
+	file := filepath.Join(t.TempDir(), "stdin")
+	writeFile(t, file, source)
+
+	code, out, errOut := lint(t, source, "--config", policy, "--output", "json", "-", file)
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, rulesFired(t, out)["stdin"], "service-required")
+	require.Contains(t, out, `"filename": "stdin"`)
+	require.Contains(t, out, `"file": "stdin"`)
+
+	code, out, errOut = lint(t, "", "--config", policy, "--output", "json", file)
+	require.Equal(t, 0, code, errOut)
+	require.NotContains(t, out, "service-required")
+
+	code, out, errOut = lint(t, source, "--config", policy, "--severity", "service-required=warning", "-")
+	require.Equal(t, 0, code, errOut)
+	require.Contains(t, out, "warning:")
+}
+
+func TestStdinKeepsDefaultEnvironment(t *testing.T) {
+	t.Parallel()
+
+	policy := writeSettings(t, `run:
+  kubernetes:
+    memoryLimit: 256Mi
+    overrides:
+      - paths: ['*']
+        enabled: false
+rules:
+  default: none
+  enable: [memory-limiter-sizing]
+`)
+
+	const source = "processors:\n  memory_limiter: {check_interval: 1s, limit_mib: 512}\n"
+
+	file := filepath.Join(t.TempDir(), "stdin")
+	writeFile(t, file, source)
+
+	code, out, errOut := lint(t, source, "--config", policy, "--verbose", "-", file)
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, out, "[memory-limiter-sizing]")
+	require.Contains(t, errOut, "stdin: kubernetes, memory limit 256Mi")
+	require.Contains(t, errOut, file+": no deployment environment")
+}
+
+func TestStdinSyntaxErrorKeepsDisplayName(t *testing.T) {
+	t.Parallel()
+
+	code, out, errOut := lint(t, "receivers: [", "--no-config", "--output", "json", "-")
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, out, `"filename": "stdin"`)
+	require.Contains(t, out, `"file": "stdin"`)
+	require.Contains(t, out, `"msg": "stdin:`)
+}
+
+func TestSampledDebugSeverityOverride(t *testing.T) {
+	t.Parallel()
+
+	const src = `exporters:
+  debug:
+    verbosity: detailed
+    sampling_initial: 5
+    sampling_thereafter: 200
+service:
+  pipelines:
+    logs:
+      exporters: [debug]
+`
+
+	args := []string{"--default", "none", "-E", "debug-exporter-verbosity", "--fail-on", "warning"}
+	code, out, errOut := lint(t, src, append(args, "-")...)
+	require.Equal(t, 0, code, errOut)
+	require.Contains(t, out, "info:")
+	code, out, errOut = lint(t, src, append(args, "--severity", "debug-exporter-verbosity=warning", "-")...)
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, out, "warning:")
+}
+
+func TestKubernetesBindingSeverityPolicy(t *testing.T) {
+	t.Parallel()
+
+	const source = `receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: '0.0.0.0:4317'}
+exporters: {debug: {}}
+service:
+  pipelines:
+    traces: {receivers: [otlp], exporters: [debug]}
+`
+
+	policy := writeSettings(t, `run:
+  kubernetes:
+    hostNetwork: false
+    overrides:
+      - paths: [host.yaml]
+        enabled: true
+        hostNetwork: true
+      - paths: [unknown.yaml]
+        enabled: true
+      - paths: [outside.yaml]
+        enabled: false
+rules:
+  default: none
+  enable: [receiver-binds-all-interfaces]
+`)
+	dir := t.TempDir()
+	pod := filepath.Join(dir, "pod.yaml")
+	host := filepath.Join(dir, "host.yaml")
+
+	writeFile(t, pod, source)
+	writeFile(t, host, source)
+
+	args := []string{"--config", policy, "--fail-on", "warning", "--verbose"}
+	code, out, errOut := lint(t, "", append(args, pod)...)
+	require.Equal(t, 0, code, errOut)
+	require.Contains(t, out, "info:")
+	require.Contains(t, errOut, "kubernetes, hostNetwork false")
+	code, out, errOut = lint(t, "", append(args, host)...)
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, out, "warning:")
+	require.Contains(t, out, "node network")
+
+	for _, name := range []string{"unknown.yaml", "outside.yaml"} {
+		path := filepath.Join(dir, name)
+		writeFile(t, path, source)
+		code, out, errOut = lint(t, "", append(args, path)...)
+		require.Equal(t, 1, code, errOut)
+		require.Contains(t, out, "warning:")
+	}
+
+	code, out, errOut = lint(t, "", append(args, "--severity", "receiver-binds-all-interfaces=warning", pod)...)
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, out, "warning:")
+}
+
+func TestKubernetesBindingFlagCanOptOut(t *testing.T) {
+	t.Parallel()
+
+	policy := writeSettings(t, `run:
+  kubernetes:
+    hostNetwork: false
+rules:
+  default: none
+  enable: [receiver-binds-all-interfaces]
+`)
+
+	const source = `receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: '0.0.0.0:4317'}
+exporters: {debug: {}}
+service:
+  pipelines:
+    traces: {receivers: [otlp], exporters: [debug]}
+`
+
+	code, out, errOut := lint(t, source, "--config", policy, "--kubernetes=false", "--fail-on", "warning", "-")
+	require.Equal(t, 1, code, errOut)
+	require.Contains(t, out, "warning:")
+	require.Contains(t, out, "host has")
 }

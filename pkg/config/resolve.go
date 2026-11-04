@@ -1,6 +1,122 @@
 package config
 
-import "gopkg.in/yaml.v3"
+import (
+	"fmt"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
+)
+
+// maxExpandedNodes bounds downstream tree walks, including repeated aliases.
+const maxExpandedNodes = 100_000
+
+// expandedSize validates nodes and counts the tree before alias sharing and merge deduplication.
+// Memoized subtree sizes bound this check to the written graph's size; -1 marks
+// an unfinished subtree so cycles are rejected at the alias that closes them.
+func expandedSize(path string, n *yaml.Node, sizes map[*yaml.Node]int) (int, error) {
+	if n == nil {
+		return 0, nil
+	}
+
+	if size, found := sizes[n]; found {
+		return size, nil
+	}
+
+	sizes[n] = -1
+	children := n.Content
+
+	if n.Kind == yaml.AliasNode {
+		if sizes[n.Alias] == -1 {
+			return 0, &SyntaxError{Path: path, Line: n.Line, Column: n.Column,
+				Msg: "config contains a cyclic YAML alias"}
+		}
+
+		children = []*yaml.Node{n.Alias}
+	}
+
+	size := 1
+
+	for _, child := range children {
+		count, err := expandedSize(path, child, sizes)
+		if err != nil {
+			return 0, err
+		}
+
+		size += count
+		if size > maxExpandedNodes {
+			return 0, &SyntaxError{Path: path, Line: child.Line, Column: child.Column,
+				Msg: fmt.Sprintf("config exceeds YAML expansion limit of %d nodes", maxExpandedNodes)}
+		}
+	}
+
+	err := validateNode(path, n)
+	if err != nil {
+		return 0, err
+	}
+
+	sizes[n] = size
+
+	return size, nil
+}
+
+// validateNode checks decode constraints without materializing aliases or rejecting duplicate keys.
+func validateNode(path string, n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		if n.Style&yaml.TaggedStyle == 0 {
+			return nil
+		}
+
+		var value any
+
+		err := n.Decode(&value)
+		if err != nil {
+			return &SyntaxError{Path: path, Line: n.Line, Column: n.Column,
+				Msg: strings.TrimPrefix(err.Error(), "yaml: ")}
+		}
+	case yaml.MappingNode:
+		for _, e := range entries(n, "") {
+			key := aliasTarget(e.KeyNode)
+			if key.Kind == yaml.MappingNode || key.Kind == yaml.SequenceNode {
+				return &SyntaxError{Path: path, Line: e.KeyNode.Line, Column: e.KeyNode.Column,
+					Msg: "invalid map key: keys must be scalar values"}
+			}
+
+			if e.KeyNode.Tag != MergeTag {
+				continue
+			}
+
+			value := aliasTarget(e.Node)
+
+			sources := []*yaml.Node{value}
+			if value.Kind == yaml.SequenceNode {
+				sources = value.Content
+			}
+
+			for _, source := range sources {
+				if aliasTarget(source).Kind != yaml.MappingNode {
+					return &SyntaxError{Path: path, Line: e.Node.Line, Column: e.Node.Column,
+						Msg: "map merge requires map or sequence of maps as the value"}
+				}
+			}
+		}
+	default:
+		// Aliases and containers are checked through their children.
+	}
+
+	return nil
+}
+
+// aliasTarget is called only after expandedSize has rejected cycles.
+func aliasTarget(n *yaml.Node) *yaml.Node {
+	for n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+
+	return n
+}
 
 // MergeTag is the tag yaml.v3 gives the YAML merge key, "<<". The tag rather
 // than the spelling is what says a key is one: a quoted "<<" is a plain string
@@ -22,22 +138,18 @@ const MergeTag = "!!merge"
 // Nodes are reused rather than copied, so a merged setting keeps the position
 // it was written at: a finding about it lands on the line in the anchor, which
 // is the line the reader has to edit.
+// Cycles and excessive expansion are rejected before this pass.
 func resolve(root *yaml.Node) {
-	r := resolver{active: map[*yaml.Node]bool{}, walked: map[*yaml.Node]bool{}}
+	r := resolver{walked: sets.New[*yaml.Node]()}
 	r.value(root)
 }
 
 // resolver carries what a single pass over one document has to remember.
 type resolver struct {
-	// active is the aliases currently being followed, which is what stops an
-	// anchor that contains itself from recursing forever. yaml.v3 refuses such
-	// a document when it decodes one, but it hands back the node tree without
-	// complaint, so the linter has to survive it to report anything at all.
-	active map[*yaml.Node]bool
 	// walked is the nodes already rewritten. An anchor merged into a dozen
 	// components is one node reached a dozen times, and rewriting it once is
 	// both faster and what keeps its own merges from being applied twice.
-	walked map[*yaml.Node]bool
+	walked sets.Set[*yaml.Node]
 }
 
 // value returns what a node stands for: an alias becomes the node it names,
@@ -53,26 +165,20 @@ func (r *resolver) value(n *yaml.Node) *yaml.Node {
 		return n
 	}
 
-	// An alias naming no anchor, or one that leads back to itself, is left as
-	// it was written: there is nothing to put in its place, and a document
-	// holding either does not load for the collector either.
-	if n.Alias == nil || r.active[n] {
+	if n.Alias == nil {
 		return n
 	}
-
-	r.active[n] = true
-	defer delete(r.active, n)
 
 	return r.value(n.Alias)
 }
 
 // walk rewrites a node's children, once per node however many aliases reach it.
 func (r *resolver) walk(n *yaml.Node) {
-	if r.walked[n] {
+	if r.walked.Has(n) {
 		return
 	}
 
-	r.walked[n] = true
+	r.walked.Insert(n)
 
 	if n.Kind == yaml.MappingNode {
 		r.mapping(n)
@@ -85,7 +191,7 @@ func (r *resolver) walk(n *yaml.Node) {
 	}
 }
 
-// mapping rewrites one mapping: its values resolved, and the entries its merge
+// mapping rewrites one mapping: its keys and values resolved, and the entries its merge
 // keys supply spliced in behind the keys it writes itself.
 func (r *resolver) mapping(n *yaml.Node) {
 	local := make([]*yaml.Node, 0, len(n.Content))
@@ -102,7 +208,7 @@ func (r *resolver) mapping(n *yaml.Node) {
 			continue
 		}
 
-		local = append(local, k, r.value(v))
+		local = append(local, r.value(k), r.value(v))
 	}
 
 	local = append(local, mergedEntries(local, merged)...)
@@ -111,38 +217,18 @@ func (r *resolver) mapping(n *yaml.Node) {
 
 // mergeSources returns the mappings an entry merges in, and whether the entry
 // is a merge at all.
-//
-// A merge whose value is neither a mapping nor a list of them is not one the
-// collector can load -- yaml.v3 fails the decode outright -- so it is left in
-// place as the key it was written as, where the rules can say something about
-// it rather than the linter quietly dropping it.
+// The preflight has already checked that every source is a mapping.
 func (r *resolver) mergeSources(k, v *yaml.Node) ([]*yaml.Node, bool) {
 	if k.Tag != MergeTag {
 		return nil, false
 	}
 
 	val := r.value(v)
-
-	switch {
-	case val == nil:
-		return nil, false
-	case val.Kind == yaml.MappingNode:
+	if val.Kind == yaml.MappingNode {
 		return []*yaml.Node{val}, true
-	case val.Kind != yaml.SequenceNode:
-		return nil, false
 	}
 
-	out := make([]*yaml.Node, 0, len(val.Content))
-
-	for _, item := range val.Content {
-		if item.Kind != yaml.MappingNode {
-			return nil, false
-		}
-
-		out = append(out, item)
-	}
-
-	return out, true
+	return val.Content, true
 }
 
 // mergedEntries returns the key/value pairs the merges supply that the mapping
@@ -154,9 +240,9 @@ func mergedEntries(local, merged []*yaml.Node) []*yaml.Node {
 		return nil
 	}
 
-	seen := make(map[string]bool, len(local)/mappingStride)
+	seen := make(sets.Set[string], len(local)/mappingStride)
 	for i := 0; i < len(local); i += mappingStride {
-		seen[local[i].Value] = true
+		seen.Insert(local[i].Value)
 	}
 
 	var out []*yaml.Node
@@ -164,11 +250,11 @@ func mergedEntries(local, merged []*yaml.Node) []*yaml.Node {
 	for _, src := range merged {
 		for i := 0; i+1 < len(src.Content); i += mappingStride {
 			k, v := src.Content[i], src.Content[i+1]
-			if seen[k.Value] {
+			if seen.Has(k.Value) {
 				continue
 			}
 
-			seen[k.Value] = true
+			seen.Insert(k.Value)
 			out = append(out, k, v)
 		}
 	}

@@ -5,8 +5,6 @@ package receiverbindsallinterfaces
 import (
 	"slices"
 
-	"github.com/samber/lo"
-	"github.com/samber/mo"
 	"gopkg.in/yaml.v3"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
@@ -91,12 +89,12 @@ func (r receiverBindsAllInterfaces) reportBinds(
 	ctx *rule.Context, kind config.Kind, c config.Component, m *yaml.Node, path string,
 ) {
 	for _, key := range bindKeys() {
-		node, written := rule.ChildNode(m, key).Get()
+		node, written := rule.ChildNode(m, key)
 		if !written {
 			continue
 		}
 
-		if scalar, readable := rule.EndpointScalar(node).Get(); readable {
+		if scalar, readable := rule.EndpointScalar(node); readable {
 			r.report(ctx, kind, c, scalar, rule.JoinPath(path, key))
 		}
 	}
@@ -107,8 +105,10 @@ func (r receiverBindsAllInterfaces) reportBinds(
 // that never open a listener at all.
 func (r receiverBindsAllInterfaces) skip(ctx *rule.Context, kind config.Kind, c config.Component) bool {
 	if kind == config.KindExtension {
-		if lo.ContainsBy(rule.DebugExtensions(), func(e rule.DebugExtension) bool { return e.Type == c.ID.Type }) {
-			return true // debug-extension-exposed says something sharper about these
+		for _, e := range rule.DebugExtensions() {
+			if e.Type == c.ID.Type {
+				return true // debug-extension-exposed says something sharper about these
+			}
 		}
 
 		if slices.Contains(probeExtensions(), c.ID.Type) {
@@ -132,23 +132,44 @@ func (r receiverBindsAllInterfaces) report(
 		return
 	}
 
-	ctx.Report(rule.Finding{
+	finding := rule.Finding{
 		Node: node, Path: path,
 		Message: rule.Quote(rule.ShortPath(path)) + " binds " + rule.Quote(node.Value) +
 			", every interface the host has, for " + string(kind) + " " + rule.Quote(c.ID.String()),
 		Hint: bindHint(rule.EndpointPort(node.Value)),
 		Docs: rule.ConfigSecurityDocs,
-	})
+	}
+
+	if ctx.Env.Kubernetes {
+		network := "the pod or node network namespace (hostNetwork is unknown)"
+
+		if ctx.Env.HostNetwork != nil {
+			if *ctx.Env.HostNetwork {
+				network = "the node network namespace (hostNetwork is true)"
+			} else {
+				network = "the pod network namespace"
+				finding.Severity = diag.Info
+			}
+		}
+
+		finding.Message = rule.Quote(rule.ShortPath(path)) + " binds " + rule.Quote(node.Value) +
+			", every interface in " + network + ", for " + string(kind) + " " + rule.Quote(c.ID.String())
+		finding.Hint = "confirm this listener is intended to be reachable from other pods; " +
+			"check NetworkPolicy and hostNetwork (which shares the node network); " +
+			"use a specific address when only local clients need access"
+	}
+
+	ctx.Report(finding)
 }
 
 // bindHint names the fix upstream documents rather than only saying not to do
 // it: an interface chosen on purpose, and in Kubernetes the pod's own IP, which
 // the downward API supplies and which reaches other pods without also reaching
 // everything else the node is on.
-func bindHint(port mo.Option[string]) string {
+func bindHint(port string, known bool) string {
 	loopback, pod := "127.0.0.1", "${env:MY_POD_IP}"
-	if p, known := port.Get(); known {
-		loopback, pod = loopback+":"+p, pod+":"+p
+	if known {
+		loopback, pod = loopback+":"+port, pod+":"+port
 	}
 
 	return "bind the interface you meant, e.g. " + loopback + " when every client is local; " +

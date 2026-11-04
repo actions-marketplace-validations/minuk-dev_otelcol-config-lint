@@ -66,7 +66,13 @@ func TestHardcodedSecret(t *testing.T) {
 		"prometheus credentials": {settings: "    credentials: abc123def456", want: true},
 		// The $VAR shorthand is an expansion only as the whole value; a
 		// generated password containing one is still a password.
-		"a password containing a dollar": {settings: `    password: pa$sw0rd`, want: true},
+		"escaped braces":                     {settings: `    password: pa$${literal}ss`, want: true},
+		"escaped shorthand":                  {settings: `    password: $$TOKEN`, want: true},
+		"escaped braces and password dollar": {settings: `    password: $${env:TOKEN}pa$sw0rd`, want: true},
+		"escaped then real expansion":        {settings: `    password: $${literal}${env:TOKEN}`, want: false},
+		"odd dollar prefix":                  {settings: `    password: $$${env:TOKEN}`, want: false},
+		"even dollar prefix":                 {settings: `    password: $$$${env:TOKEN}`, want: true},
+		"a password containing a dollar":     {settings: `    password: pa$sw0rd`, want: true},
 
 		// The public half of a keypair is not a credential.
 		"an inline certificate": {settings: "    cert_pem: BEGIN CERTIFICATE", want: false},
@@ -87,10 +93,16 @@ func TestHardcodedSecret(t *testing.T) {
 
 		// A key that names where a credential lives is the opposite of the
 		// problem: it is a properly configured component.
-		"a key file":      {settings: "    private_key_file: /etc/certs/key.pem", want: false},
-		"a password file": {settings: "    password_file: /etc/otel/password", want: false},
-		"a token url":     {settings: "    token_url: https://issuer/oauth2/token", want: false},
-		"a secret name":   {settings: "    secret_name: otel-collector-credentials", want: false},
+		"a key file":               {settings: "    private_key_file: /etc/certs/key.pem", want: false},
+		"a password file":          {settings: "    password_file: /etc/otel/password", want: false},
+		"a token url":              {settings: "    token_url: https://issuer/oauth2/token", want: false},
+		"a token environment":      {settings: "    default_logstore_token_env: prod", want: false},
+		"a token type":             {settings: "    token_type: bearer", want: false},
+		"a secret mode":            {settings: "    secret_mode: managed", want: false},
+		"a credential format":      {settings: "    credential_format: json", want: false},
+		"shouted metadata":         {settings: "    DEFAULT_TOKEN_ENV: prod", want: false},
+		"metadata plus credential": {settings: "    token_env: prod\n    token: abc123def456", want: true},
+		"a secret name":            {settings: "    secret_name: otel-collector-credentials", want: false},
 
 		// A bare "key" is an ordinary setting across the collector, and
 		// matching it would report half of every config.
@@ -136,6 +148,9 @@ func TestHardcodedSecretInHeaders(t *testing.T) {
 		settings string
 		want     bool
 	}{
+		"token header ending in env":   {settings: "    headers:\n      x-auth-token-env: abc123def456", want: true},
+		"secret header ending in type": {settings: "    headers:\n      x-secret-type: abc123def456", want: true},
+		"bearer metadata-like header":  {settings: "    headers:\n      x-env: Bearer abc123def456", want: true},
 		"a bearer token": {
 			settings: "    headers:\n      authorization: Bearer abc123def456",
 			want:     true,
@@ -305,4 +320,26 @@ service:
 	found := check(t, src)
 	require.Len(t, found, 1)
 	assert.Equal(t, "exporters.otlp.headers.authorization", found[0].Path)
+	assert.Equal(t, 7, found[0].Position.Line)
+}
+
+func TestHardcodedSecretChecksEachAliasContext(t *testing.T) {
+	t.Parallel()
+
+	for name, settings := range map[string]string{
+		"scalar key":     "    label: &shared abc123def456\n    token: *shared\n",
+		"sequence key":   "    labels: &shared [abc123def456]\n    api_keys: *shared\n",
+		"headers":        "    metadata: &shared {authorization: Bearer abc123def456}\n    headers: *shared\n",
+		"merged headers": "    metadata: &shared {authorization: Bearer abc123def456}\n    headers:\n      <<: *shared\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			found := check(t, secreting(settings))
+			require.Len(t, found, 1)
+			assert.Equal(t, 6, found[0].Position.Line, "the finding keeps the anchor's source position")
+			assert.NotContains(t, found[0].Path, "label")
+			assert.NotContains(t, found[0].Path, "metadata")
+		})
+	}
 }

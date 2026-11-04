@@ -53,9 +53,12 @@ func (p EnvironmentPolicy) Validate() error {
 // the policy, which is why LintAll's workers can all call it at once; a policy
 // must therefore not be changed once linting has started.
 //
-// Config read from standard input is reported under a name no glob is meant to
-// match, so it resolves to the defaults.
+// The standard-input marker resolves to defaults regardless of wildcard overrides.
 func (p EnvironmentPolicy) Resolve(path string) rule.Environment {
+	if path == scanner.StdinMarker {
+		return p.Default
+	}
+
 	for _, over := range p.Overrides {
 		for _, pattern := range over.Paths {
 			if scanner.Match(pattern, path) {
@@ -70,5 +73,5 @@ func (p EnvironmentPolicy) Resolve(path string) rule.Environment {
 // Configured reports whether the policy can resolve anything at all, so a
 // caller can stay quiet about environments nobody asked for.
 func (p EnvironmentPolicy) Configured() bool {
-	return p.Default.Known() || len(p.Overrides) > 0
+	return p.Default.Kubernetes || len(p.Overrides) > 0
 }

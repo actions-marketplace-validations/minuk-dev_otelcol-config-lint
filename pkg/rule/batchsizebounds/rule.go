@@ -16,6 +16,7 @@ import (
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/rule"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // The numbers upstream defaults to, in the batchprocessor's factory.
@@ -68,11 +69,13 @@ func (b batchProcessor) at(s rule.Setting) *yaml.Node { return rule.NodeOr(s.Nod
 
 // batchProcessors returns every declared batch processor, matched on type so
 // "batch/traces" is covered too.
-func batchProcessors(f *config.File) []batchProcessor {
-	return rule.ProcessorsOfType(f, rule.BatchType, readBatch)
+func batchProcessors(ctx *rule.Context) []batchProcessor {
+	return rule.ProcessorsOfType(ctx.File, rule.BatchType, func(c config.Component) batchProcessor {
+		return readBatch(ctx, c)
+	})
 }
 
-func readBatch(c config.Component) batchProcessor {
+func readBatch(ctx *rule.Context, c config.Component) batchProcessor {
 	proc := batchProcessor{
 		id:               c.ID,
 		node:             rule.NodeOr(c.KeyNode, c.ValueNode),
@@ -90,9 +93,9 @@ func readBatch(c config.Component) batchProcessor {
 	for _, e := range rule.MapEntries(c.ValueNode, proc.path) {
 		switch e.Key {
 		case "send_batch_size":
-			proc.sendBatchSize = rule.ReadInt(e.Node)
+			proc.sendBatchSize = ctx.ReadInt(e.Node)
 		case "send_batch_max_size":
-			proc.sendBatchMaxSize = rule.ReadInt(e.Node)
+			proc.sendBatchMaxSize = ctx.ReadInt(e.Node)
 		case "timeout":
 			proc.timeout = rule.ReadDuration(e.Node)
 		case "metadata_keys":
@@ -108,7 +111,7 @@ func readBatch(c config.Component) batchProcessor {
 type batchSizeBounds struct{ rule.Base }
 
 func (r batchSizeBounds) Check(ctx *rule.Context) {
-	for _, proc := range batchProcessors(ctx.File) {
+	for _, proc := range batchProcessors(ctx) {
 		// A size the field cannot hold stands on its own: it fails to decode
 		// whatever the other field says, and it stops the comparison, which
 		// the collector never reaches.
@@ -135,8 +138,18 @@ func (r batchSizeBounds) checkSizes(ctx *rule.Context, proc batchProcessor) {
 		return
 	}
 
+	useDefault := !proc.sendBatchSize.Present
+	if proc.sendBatchSize.Present && rule.IsNull(proc.sendBatchSize.Node) {
+		_, zero, known := ctx.Schema.ScalarDecoding()
+		if !known {
+			return
+		}
+
+		useDefault = !zero
+	}
+
 	size := int64(defaultSendBatchSize)
-	if proc.sendBatchSize.Known {
+	if proc.sendBatchSize.Known && !useDefault {
 		size = proc.sendBatchSize.Num
 	}
 
@@ -148,7 +161,7 @@ func (r batchSizeBounds) checkSizes(ctx *rule.Context, proc batchProcessor) {
 	// the message the reader will not find in their file, so it is named as a
 	// default rather than quoted back at them as if they had written it.
 	written := " and send_batch_size to " + rule.Itoa64(size)
-	if !proc.sendBatchSize.Present {
+	if useDefault {
 		written = ", below the default send_batch_size of " + rule.Itoa64(size)
 	}
 
@@ -176,15 +189,20 @@ func (r batchSizeBounds) checkRange(ctx *rule.Context, proc batchProcessor) bool
 		{key: "send_batch_size", val: proc.sendBatchSize},
 		{key: "send_batch_max_size", val: proc.sendBatchMaxSize},
 	} {
-		if !size.val.Known || (size.val.Num >= 0 && size.val.Num <= maxBatchSize) {
+		if !size.val.InvalidUint32() {
 			continue
 		}
 
 		found = true
 
+		value := rule.Itoa64(size.val.Num)
+		if size.val.Node != nil {
+			value = size.val.Node.Value
+		}
+
 		ctx.Report(rule.Finding{
 			Node: proc.at(size.val), Path: rule.JoinPath(proc.path, size.key),
-			Message: proc.name() + " sets " + size.key + " to " + rule.Itoa64(size.val.Num) +
+			Message: proc.name() + " sets " + size.key + " to " + value +
 				", which the field cannot hold: it counts items as a uint32, " +
 				"so the collector fails to load the config before it validates it",
 			Hint: "write a whole number between 0 and " + rule.Itoa64(maxBatchSize),
@@ -220,7 +238,7 @@ func (r batchSizeBounds) checkMetadataKeys(ctx *rule.Context, proc batchProcesso
 	}
 
 	path := rule.JoinPath(proc.path, "metadata_keys")
-	seen := map[string]bool{}
+	seen := sets.New[string]()
 
 	for i, item := range proc.metadataKeys.Content {
 		if item.Kind != yaml.ScalarNode || rule.HasExpansion(item.Value) {
@@ -228,8 +246,8 @@ func (r batchSizeBounds) checkMetadataKeys(ctx *rule.Context, proc batchProcesso
 		}
 
 		folded := strings.ToLower(item.Value)
-		if !seen[folded] {
-			seen[folded] = true
+		if !seen.Has(folded) {
+			seen.Insert(folded)
 
 			continue
 		}

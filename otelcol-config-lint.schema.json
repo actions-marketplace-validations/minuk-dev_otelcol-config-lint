@@ -21,6 +21,7 @@
         "empty-pipeline",
         "hardcoded-secret",
         "insecure-tls",
+        "invalid-component-id",
         "invalid-pipeline-key",
         "invalid-value",
         "memory-limiter-config",
@@ -133,7 +134,11 @@
       "description": "Deprecated: moved to run.kubernetes.",
       "properties": {
         "enabled": {
-          "description": "The configs run in a Kubernetes pod. Defaults to true when either memory number is written.",
+          "description": "The configs run in a Kubernetes pod. Defaults to true when hostNetwork or either memory number is written.",
+          "type": "boolean"
+        },
+        "hostNetwork": {
+          "description": "Whether the pod shares the node network. Omit when unknown; only explicit false lowers wildcard listener findings to info.",
           "type": "boolean"
         },
         "memoryLimit": {
@@ -151,7 +156,11 @@
             "description": "One path-matched environment. It replaces the defaults for the files it matches rather than merging with them.",
             "properties": {
               "enabled": {
-                "description": "The configs run in a Kubernetes pod. Defaults to true when either memory number is written.",
+                "description": "The configs run in a Kubernetes pod. Defaults to true when hostNetwork or either memory number is written.",
+                "type": "boolean"
+              },
+              "hostNetwork": {
+                "description": "Whether the pod shares the node network. Omit when unknown; only explicit false lowers wildcard listener findings to info.",
                 "type": "boolean"
               },
               "memoryLimit": {
@@ -257,11 +266,47 @@
           },
           "type": "array"
         },
+        "overrides": {
+          "items": {
+            "additionalProperties": false,
+            "description": "First matching entry overlays global rule policy; explicit CLI flags win.",
+            "properties": {
+              "disable": {
+                "items": {
+                  "$ref": "#/$defs/rule"
+                },
+                "type": "array"
+              },
+              "paths": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "severity": {
+                "additionalProperties": {
+                  "$ref": "#/$defs/severity"
+                },
+                "propertyNames": {
+                  "$ref": "#/$defs/rule"
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "paths"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "settings": {
           "additionalProperties": {
             "type": "object"
           },
-          "description": "Each rule's own settings, keyed by rule name. No built-in rule reads a block yet, so writing one is currently reported as an error.",
+          "description": "Each rule's own settings, keyed by rule name. Rules that do not support settings reject a block.",
           "propertyNames": {
             "$ref": "#/$defs/rule"
           },
@@ -311,6 +356,10 @@
           ],
           "type": "string"
         },
+        "embedded": {
+          "description": "Check collector configs in Kubernetes ConfigMap data blocks.",
+          "type": "boolean"
+        },
         "exclude": {
           "description": "Glob patterns to skip when walking a directory. Matched against both the whole path and the base name; there is no \"**\".",
           "items": {
@@ -331,7 +380,11 @@
           "description": "The pods the configs run in, for the rules that cannot judge a config without knowing what it runs in.",
           "properties": {
             "enabled": {
-              "description": "The configs run in a Kubernetes pod. Defaults to true when either memory number is written.",
+              "description": "The configs run in a Kubernetes pod. Defaults to true when hostNetwork or either memory number is written.",
+              "type": "boolean"
+            },
+            "hostNetwork": {
+              "description": "Whether the pod shares the node network. Omit when unknown; only explicit false lowers wildcard listener findings to info.",
               "type": "boolean"
             },
             "memoryLimit": {
@@ -349,7 +402,11 @@
                 "description": "One path-matched environment. It replaces the defaults for the files it matches rather than merging with them.",
                 "properties": {
                   "enabled": {
-                    "description": "The configs run in a Kubernetes pod. Defaults to true when either memory number is written.",
+                    "description": "The configs run in a Kubernetes pod. Defaults to true when hostNetwork or either memory number is written.",
+                    "type": "boolean"
+                  },
+                  "hostNetwork": {
+                    "description": "Whether the pod shares the node network. Omit when unknown; only explicit false lowers wildcard listener findings to info.",
                     "type": "boolean"
                   },
                   "memoryLimit": {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // The releases the availability fixtures below are written against, newest
@@ -57,7 +58,7 @@ func TestSpansOfIsOpenAtTheNewestRelease(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := schema.SpansOf(fixtureReleases, set(tt.present))
+			got := schema.SpansOf(fixtureReleases, sets.New(tt.present...))
 			assert.Equal(t, tt.want, got)
 
 			// Whatever the spans came out as, reading them back names the
@@ -153,7 +154,7 @@ func TestAvailabilityFromADirectory(t *testing.T) {
 }
 
 // TestAvailabilityIsOneFetch is the point of the whole document: a registry
-// that publishes one is asked once, instead of once per release.
+// that publishes one is asked once per lookup, instead of once per release.
 func TestAvailabilityIsOneFetch(t *testing.T) {
 	t.Parallel()
 
@@ -187,12 +188,12 @@ func TestAvailabilityIsOneFetch(t *testing.T) {
 	assert.Equal(t, []string{"v0.110.0", "v0.150.0"}, avail[config.KindReceiver]["logging"],
 		"a closed span should stop where the component was dropped")
 
-	// The index and the availability document, once each; asking again is
-	// answered from what the process already read.
+	// The index and the availability document, once each per lookup. NoCache
+	// requests fresh data on the second lookup too.
 	assert.Equal(t, int64(2), requests.Load())
 
 	store.Availability(t.Context())
-	assert.Equal(t, int64(2), requests.Load(), "a second question should not be a second fetch")
+	assert.Equal(t, int64(4), requests.Load(), "NoCache should fetch again")
 }
 
 // TestAvailabilityWithoutADocument covers every registry published before this
@@ -224,14 +225,4 @@ func components(spans []schema.Span) *schema.Components {
 	return &schema.Components{Distributions: map[string]schema.ComponentSpans{
 		distContrib: {config.KindReceiver: {"otlp": spans}},
 	}}
-}
-
-// set turns a list of releases into what SpansOf takes.
-func set(versions []string) map[string]bool {
-	out := map[string]bool{}
-	for _, v := range versions {
-		out[v] = true
-	}
-
-	return out
 }

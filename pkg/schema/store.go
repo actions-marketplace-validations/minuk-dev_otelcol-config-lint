@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/afero"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // Extensions returns the schema file suffixes, in preference order. The
@@ -60,6 +61,9 @@ const DistributionPlaceholder = "{{.Distribution}}"
 // defaultFetchTimeout bounds a remote schema download when the caller has not
 // supplied its own client.
 const defaultFetchTimeout = 30 * time.Second
+
+// maxSchemaRedirects matches net/http's default redirect limit.
+const maxSchemaRedirects = 10
 
 // maxRemoteBytes bounds what one remote schema or index may deliver, and
 // maxRemoteMiB is the same number as the error reports it. A location is
@@ -128,14 +132,14 @@ type Store struct {
 // remote locations cannot be enumerated, so they never appear here even though
 // Load can still resolve them.
 func (s Store) Versions(ctx context.Context) []string {
-	seen := map[string]bool{}
+	seen := sets.New[string]()
 
 	var out []string
 
 	for _, loc := range s.locations() {
 		for _, v := range s.versionsAt(ctx, loc) {
-			if v != "" && !seen[v] {
-				seen[v] = true
+			if v != "" && !seen.Has(v) {
+				seen.Insert(v)
 				out = append(out, v)
 			}
 		}
@@ -199,6 +203,8 @@ func (s Store) WithDistribution(distribution string) Store {
 
 // Load returns the schema for a collector version. The special value "latest"
 // (or an empty string) selects the newest schema the store can enumerate.
+// The schema must declare that version and the store's distribution. Legacy
+// schemas without a distribution are treated as DefaultDistribution.
 func (s Store) Load(ctx context.Context, version string) (*Schema, error) {
 	err := s.Validate()
 	if err != nil {
@@ -220,6 +226,10 @@ func (s Store) Load(ctx context.Context, version string) (*Schema, error) {
 
 	for _, loc := range s.locations() {
 		c, err := s.loadFrom(ctx, loc, version)
+		if err == nil {
+			err = c.validateIdentity(version, s.distribution())
+		}
+
 		switch {
 		case err == nil:
 			return c, nil
@@ -231,6 +241,26 @@ func (s Store) Load(ctx context.Context, version string) (*Schema, error) {
 	}
 
 	return nil, &UnknownVersionError{Version: version, Available: s.Versions(ctx), Tried: tried}
+}
+
+func (c *Schema) validateIdentity(version, distribution string) error {
+	if Normalize(c.CollectorVersion) != version {
+		return fmt.Errorf("%w: collectorVersion is %q, want %q; check --schema-location or regenerate the schema",
+			errSchemaIdentity, c.CollectorVersion, version)
+	}
+
+	actual := c.Distribution
+	if actual == "" {
+		actual = DefaultDistribution
+	}
+
+	if actual != distribution {
+		return fmt.Errorf("%w: distribution is %q, want %q (missing distribution means %q); "+
+			"check --schema-location or regenerate the schema with an explicit distribution",
+			errSchemaIdentity, c.Distribution, distribution, DefaultDistribution)
+	}
+
+	return nil
 }
 
 // Validate reports the first location the store will refuse, so a command can
@@ -281,7 +311,7 @@ func (s Store) indexAt(ctx context.Context, loc string) *Index {
 
 		return idx
 	case locDir:
-		idx, err := readIndexFile(s.fs(), filepath.Join(loc, IndexFile))
+		idx, err := ReadIndexFileFS(s.fs(), filepath.Join(loc, IndexFile))
 		if err != nil {
 			return nil
 		}
@@ -305,7 +335,7 @@ func (s Store) componentsAt(ctx context.Context, loc string) *Components {
 
 		return comps
 	case locDir:
-		comps, err := readComponentsFile(s.fs(), filepath.Join(loc, ComponentsFile))
+		comps, err := ReadComponentsFileFS(s.fs(), filepath.Join(loc, ComponentsFile))
 		if err != nil {
 			return nil
 		}
@@ -328,7 +358,7 @@ func (s Store) versionsAt(ctx context.Context, loc string) []string {
 
 		return idx.Versions(s.distribution())
 	case locDir:
-		idx, err := readIndexFile(s.fs(), filepath.Join(loc, IndexFile))
+		idx, err := ReadIndexFileFS(s.fs(), filepath.Join(loc, IndexFile))
 		if err == nil {
 			return idx.Versions(s.distribution())
 		}
@@ -396,7 +426,8 @@ func (s Store) locations() []string {
 
 var (
 	// errNotFound signals that a location does not have the requested version.
-	errNotFound = errors.New("schema not found")
+	errNotFound       = errors.New("schema not found")
+	errSchemaIdentity = errors.New("schema identity mismatch")
 	// errNoSchemas signals that no location could be enumerated at all.
 	errNoSchemas = errors.New("no schemas available")
 	// errBadStatus signals a remote location answering with an unusable status.
@@ -407,6 +438,7 @@ var (
 	// that permits one.
 	errInsecureLocation = errors.New("refusing to fetch a schema over plain http, " +
 		"which anyone on the path can rewrite")
+	errTooManyRedirects = errors.New("stopped after 10 redirects")
 )
 
 func (s Store) loadFrom(ctx context.Context, loc, version string) (*Schema, error) {
@@ -498,7 +530,7 @@ func (s Store) loadFlat(dir, version string) (*Schema, error) {
 
 		_, err := s.fs().Stat(path)
 		if err == nil {
-			return readFile(s.fs(), path)
+			return ReadFileFS(s.fs(), path)
 		}
 	}
 
@@ -513,7 +545,7 @@ func (s Store) readLocal(path string) (*Schema, error) {
 		return nil, errNotFound
 	}
 
-	return readFile(s.fs(), path)
+	return ReadFileFS(s.fs(), path)
 }
 
 // fetchIndex reads a remote registry's index, once per registry.
@@ -521,9 +553,7 @@ func (s Store) readLocal(path string) (*Schema, error) {
 // Resolving a version consults the index and so does listing them, so a run
 // that lints against several releases would otherwise fetch the same file once
 // per lookup -- against a rate limit that counts requests, the fetch this
-// field was added to save. A failure is remembered too: a registry that could
-// not answer for the index is not going to answer any faster for being asked
-// again by every version in turn.
+// field was added to save. Failed reads are retried by later lookups.
 func (s Store) fetchIndex(ctx context.Context, root string) (*Index, error) {
 	// A location this store may not read is not a fetch, and not an answer to
 	// remember: another store, allowed to read it, would be handed the refusal.
@@ -532,7 +562,7 @@ func (s Store) fetchIndex(ctx context.Context, root string) (*Index, error) {
 		return nil, err
 	}
 
-	return indexMemo.do(root, func() (*Index, error) {
+	return indexMemo.do(root, s.memoizeDocuments(), func() (*Index, error) {
 		// The index grows a line per release, so what is cached from a previous
 		// run is offered back with its validator rather than trusted outright.
 		body, err := s.get(ctx, join(root, IndexFile), revalidated)
@@ -545,16 +575,15 @@ func (s Store) fetchIndex(ctx context.Context, root string) (*Index, error) {
 }
 
 // fetchComponents reads a remote registry's component availability index, once
-// per registry and on the same terms as its index: a registry publishing none
-// answers 404, and remembering that is what keeps the next unknown component
-// from asking again.
+// per registry and on the same terms as its index. A failed read is retried by
+// later lookups.
 func (s Store) fetchComponents(ctx context.Context, root string) (*Components, error) {
 	err := s.refuseInsecure(root)
 	if err != nil {
 		return nil, err
 	}
 
-	return componentsMemo.do(root, func() (*Components, error) {
+	return componentsMemo.do(root, s.memoizeDocuments(), func() (*Components, error) {
 		// It gains an entry per component added or dropped, so it is
 		// revalidated rather than kept, the way the index is.
 		body, err := s.get(ctx, join(root, ComponentsFile), revalidated)
@@ -570,26 +599,37 @@ func (s Store) fetchComponents(ctx context.Context, root string) (*Components, e
 // it was read from and kept for the life of the process.
 type docMemo[T any] struct{ m sync.Map }
 
-// docResult is one read, kept whether it succeeded or not.
+// docResult is one successful read.
 type docResult[T any] struct {
 	doc T
-	err error
 }
 
 // do returns what the root was read as, reading it only the first time it is
 // asked for.
-func (d *docMemo[T]) do(root string, read func() (T, error)) (T, error) {
+func (d *docMemo[T]) do(root string, useMemo bool, read func() (T, error)) (T, error) {
+	if !useMemo {
+		return read()
+	}
+
 	cached, ok := d.m.Load(root)
 	if ok {
 		result, _ := cached.(docResult[T])
 
-		return result.doc, result.err
+		return result.doc, nil
 	}
 
 	doc, err := read()
-	d.m.Store(root, docResult[T]{doc: doc, err: err})
+	if err == nil {
+		d.m.Store(root, docResult[T]{doc: doc})
+	}
 
 	return doc, err
+}
+
+// Only the default store can share a process-wide answer. Other stores may
+// fetch the same URL with a different client or read a different cache.
+func (s Store) memoizeDocuments() bool {
+	return !s.NoCache && s.HTTPClient == nil && s.Fs == nil && s.CacheDir == ""
 }
 
 // The documents a registry publishes beside its schemas, each read once.
@@ -619,12 +659,20 @@ func isInsecure(loc string) bool {
 
 // fetch reads a schema over the network.
 func (s Store) fetch(ctx context.Context, url string) (*Schema, error) {
-	body, err := s.get(ctx, url, immutable)
+	var c *Schema
+
+	_, err := s.getValidated(ctx, url, immutable, func(body []byte) error {
+		var err error
+
+		c, err = Read(bytes.NewReader(body))
+
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	return Read(bytes.NewReader(body))
+	return c, nil
 }
 
 // get performs the request behind fetch and fetchIndex, and returns what the
@@ -635,6 +683,14 @@ func (s Store) fetch(ctx context.Context, url string) (*Schema, error) {
 // fetchAttempts times; see retry.go for which statuses earn one and how long
 // each wait is.
 func (s Store) get(ctx context.Context, url string, keep freshness) ([]byte, error) {
+	return s.getValidated(ctx, url, keep, nil)
+}
+
+// getValidated checks a schema before trusting or publishing its cached body.
+// Indexes use get instead, retaining their existing revalidation behavior.
+func (s Store) getValidated(
+	ctx context.Context, url string, keep freshness, validate func([]byte) error,
+) ([]byte, error) {
 	err := s.refuseInsecure(url)
 	if err != nil {
 		return nil, err
@@ -642,7 +698,7 @@ func (s Store) get(ctx context.Context, url string, keep freshness) ([]byte, err
 
 	cache := s.cache()
 
-	cached, etag := s.cached(cache, url, keep)
+	cached, etag := s.cached(cache, url, keep, validate)
 	if cached != nil && keep == immutable {
 		return cached, nil
 	}
@@ -650,22 +706,7 @@ func (s Store) get(ctx context.Context, url string, keep freshness) ([]byte, err
 	for attempt := 0; ; attempt++ {
 		answer, err := s.attempt(ctx, url, etag)
 		if err == nil {
-			if answer.notModified {
-				// Only what was offered can come back unmodified. An endpoint
-				// answering this to a request that offered nothing has served
-				// no body and named nothing to serve instead.
-				if cached == nil {
-					return nil, notModified(url)
-				}
-
-				return cached, nil
-			}
-
-			if cache != nil {
-				cache.save(url, answer.body, answer.etag)
-			}
-
-			return answer.body, nil
+			return answer.read(cache, url, cached, validate)
 		}
 
 		var status *statusError
@@ -701,7 +742,7 @@ func notModified(url string) error {
 // the registry with it. A location whose content cannot change under the same
 // URL is not revalidated, so it carries no validator: the point of caching a
 // published schema is that no request is made at all.
-func (s Store) cached(cache *diskCache, url string, keep freshness) ([]byte, string) {
+func (s Store) cached(cache *diskCache, url string, keep freshness, validate func([]byte) error) ([]byte, string) {
 	if cache == nil {
 		return nil, ""
 	}
@@ -712,6 +753,12 @@ func (s Store) cached(cache *diskCache, url string, keep freshness) ([]byte, str
 	}
 
 	if keep == immutable {
+		if validate != nil && validate(body) != nil {
+			_ = cache.fs.Remove(cache.path(url))
+
+			return nil, ""
+		}
+
 		return body, ""
 	}
 
@@ -740,6 +787,33 @@ type served struct {
 	notModified bool
 }
 
+// read validates a response before publishing it, or uses the revalidated body.
+func (answer served) read(cache *diskCache, url string, cached []byte, validate func([]byte) error) ([]byte, error) {
+	if answer.notModified {
+		// Only what was offered can come back unmodified. An endpoint
+		// answering this to a request that offered nothing has served
+		// no body and named nothing to serve instead.
+		if cached == nil {
+			return nil, notModified(url)
+		}
+
+		return cached, nil
+	}
+
+	if validate != nil {
+		err := validate(answer.body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cache != nil {
+		cache.save(url, answer.body, answer.etag)
+	}
+
+	return answer.body, nil
+}
+
 // attempt makes one request and returns what it served, offering etag when
 // there is a cached copy to revalidate. The body is read here rather than
 // handed to a decoder so that maxRemoteBytes is enforced in one place, and so
@@ -757,7 +831,28 @@ func (s Store) attempt(ctx context.Context, url, etag string) (served, error) {
 		req.Header.Set("If-None-Match", etag)
 	}
 
-	resp, err := s.client().Do(req)
+	// Copy the client so its transport and caller policy are reused without
+	// mutating a shared client. The policy must apply before each redirect.
+	client := *s.client()
+	checkRedirect := client.CheckRedirect
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		err := s.refuseInsecure(next.URL.String())
+		if err != nil {
+			return err
+		}
+
+		if checkRedirect != nil {
+			return checkRedirect(next, via)
+		}
+
+		if len(via) >= maxSchemaRedirects {
+			return errTooManyRedirects
+		}
+
+		return nil
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return none, fmt.Errorf("fetch %s: %w", url, err)
 	}

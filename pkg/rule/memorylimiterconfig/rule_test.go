@@ -6,9 +6,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/memorylimiterconfig"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/rule/ruletest"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
 )
 
 // check runs the rule over src, which every test in this package starts from.
@@ -122,6 +124,27 @@ func TestMemoryLimiterConfigAcceptsAWorkingLimiter(t *testing.T) {
 	}
 }
 
+func TestMemoryLimiterConfigReportsMissingSchemaRequiredInterval(t *testing.T) {
+	t.Parallel()
+
+	sch := ruletest.Schema()
+	sch.Components[config.KindProcessor]["memory_limiter"].Fields = &schema.Field{
+		Type: "map", Required: []string{"check_interval"},
+		Children: map[string]*schema.Field{
+			"check_interval": {Type: "duration"},
+			"limit_mib":      {Type: "int"},
+		},
+	}
+	found, err := ruletest.RunWith(memorylimiterconfig.New(),
+		limiter("memory_limiter", "    limit_mib: 512"), ruletest.Options{Schema: sch})
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	require.Equal(t, diag.Error, found[0].Severity)
+	require.Equal(t, "processors.memory_limiter.check_interval", found[0].Path)
+	require.Contains(t, found[0].Message, "has no check_interval")
+	require.Contains(t, found[0].Hint, "set check_interval: 1s")
+}
+
 func TestMemoryLimiterConfigMatchesOnType(t *testing.T) {
 	t.Parallel()
 
@@ -140,6 +163,27 @@ func TestMemoryLimiterConfigLeavesExpansionsAlone(t *testing.T) {
 	}
 }
 
+func TestMemoryLimiterConfigDynamicBlock(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		want int
+	}{
+		{name: "${file:limits.yaml}", want: 0},
+		{name: "${env:LIMITER}", want: 0},
+		{name: "$${env:LIMITER}", want: 2},
+		{name: "null", want: 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			found := check(t, limiter("memory_limiter", "    "+tt.name))
+			require.Len(t, found, tt.want)
+		})
+	}
+}
+
 func TestMemoryLimiterConfigRemarksOnAFarOffInterval(t *testing.T) {
 	t.Parallel()
 
@@ -153,5 +197,25 @@ func TestMemoryLimiterConfigRemarksOnAFarOffInterval(t *testing.T) {
 	settings = "    check_interval: 2s\n    limit_mib: 512\n    spike_limit_mib: 128"
 	if found := check(t, limiter("memory_limiter", settings)); len(found) > 0 {
 		t.Errorf("an interval near the recommended one is a choice, not a finding: %+v", found)
+	}
+}
+
+func TestMemoryLimiterConfigNullDefaults(t *testing.T) {
+	t.Parallel()
+
+	for name, value := range map[string]string{"null": "null", "shorthand": "~", "empty": ""} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			found := check(t, limiter("memory_limiter", "    check_interval: "+value+"\n    limit_mib: 512"))
+			require.Len(t, found, 1)
+			require.Contains(t, found[0].Message, "'check_interval' must be greater than zero")
+			require.Equal(t, diag.Error, found[0].Severity)
+
+			found = check(t, limiter("memory_limiter", "    check_interval: 1s\n    limit_mib: "+value))
+			require.Len(t, found, 1)
+			require.Contains(t, found[0].Message, "'limit_mib' or 'limit_percentage' must be greater than zero")
+			require.Equal(t, diag.Error, found[0].Severity)
+		})
 	}
 }

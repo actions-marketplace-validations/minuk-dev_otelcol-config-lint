@@ -17,7 +17,16 @@ type missingMemoryLimiter struct{ rule.Base }
 
 func (r missingMemoryLimiter) Check(ctx *rule.Context) {
 	for _, p := range ctx.File.Service.Pipelines {
-		if rule.HasProcessorType(p, rule.MemoryLimiterType) || len(p.Receivers) == 0 {
+		if rule.IsExpansion(p.ProcessorsNode) {
+			continue
+		}
+
+		if rule.HasProcessorType(p, rule.MemoryLimiterType) || rule.HasDynamicRefs(p.Processors) || len(p.Receivers) == 0 {
+			continue
+		}
+
+		// Forward and routing synchronously pass same-signal data downstream.
+		if ctx.Index.UpstreamCovered(p, []string{rule.MemoryLimiterType}, []string{"forward", "routing"}) {
 			continue
 		}
 

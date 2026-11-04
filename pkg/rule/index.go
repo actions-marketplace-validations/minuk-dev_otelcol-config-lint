@@ -1,11 +1,11 @@
 package rule
 
 import (
-	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/schema"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // Index resolves references from the service block to component declarations,
@@ -14,12 +14,14 @@ type Index struct {
 	File *config.File
 
 	declared map[config.Kind]map[config.ID]config.Component
-	used     map[config.Kind]map[config.ID]bool
+	used     map[config.Kind]sets.Set[config.ID]
+	// dynamic records slots whose references cannot be resolved statically.
+	dynamic map[config.Kind]bool
 	// enabled holds the extensions service.extensions lists, which is the only
 	// place that starts one. A settings reference marks an extension used
 	// without enabling it, and telling the two apart is what lets
 	// undefined-extension-reference report an extension nobody starts.
-	enabled map[config.ID]bool
+	enabled sets.Set[config.ID]
 	// extRefs holds the extension references written inside component
 	// settings, in file order.
 	extRefs []ExtensionRef
@@ -37,8 +39,9 @@ func NewIndex(f *config.File, sch *schema.Schema) *Index {
 	idx := &Index{
 		File:       f,
 		declared:   map[config.Kind]map[config.ID]config.Component{},
-		used:       map[config.Kind]map[config.ID]bool{},
-		enabled:    map[config.ID]bool{},
+		used:       map[config.Kind]sets.Set[config.ID]{},
+		dynamic:    dynamicReferences(f.Service),
+		enabled:    sets.New[config.ID](),
 		extRefs:    extensionRefs(f, sch),
 		asReceiver: map[config.ID][]config.Pipeline{},
 		asExporter: map[config.ID][]config.Pipeline{},
@@ -46,7 +49,7 @@ func NewIndex(f *config.File, sch *schema.Schema) *Index {
 	for kind, sec := range f.Sections {
 		idx.declared[kind] = map[config.ID]config.Component{}
 
-		idx.used[kind] = map[config.ID]bool{}
+		idx.used[kind] = sets.New[config.ID]()
 		for _, c := range sec.Components {
 			// A duplicate key keeps the last declaration, matching YAML.
 			idx.declared[kind][c.ID] = c
@@ -54,9 +57,11 @@ func NewIndex(f *config.File, sch *schema.Schema) *Index {
 	}
 
 	for _, ref := range f.Service.Extensions {
-		idx.enabled[ref.ID] = true
+		if !HasExpansion(ref.ID.String()) {
+			idx.enabled.Insert(ref.ID)
 
-		idx.markUsed(config.KindExtension, ref.ID)
+			idx.markUsed(config.KindExtension, ref.ID)
+		}
 	}
 
 	// A component that names an extension in its own settings is using it,
@@ -95,6 +100,25 @@ func NewIndex(f *config.File, sch *schema.Schema) *Index {
 	return idx
 }
 
+// dynamicReferences records which service slots may be supplied by providers.
+func dynamicReferences(svc *config.Service) map[config.Kind]bool {
+	pipelines := IsExpansion(svc.Node) || IsExpansion(svc.PipelinesNode)
+	dynamic := map[config.Kind]bool{
+		config.KindExtension: IsExpansion(svc.Node) || IsExpansion(svc.ExtensionsNode) || HasDynamicRefs(svc.Extensions),
+		config.KindReceiver:  pipelines, config.KindProcessor: pipelines, config.KindExporter: pipelines,
+	}
+
+	for _, p := range svc.Pipelines {
+		for slot, node := range map[config.Kind]*yaml.Node{
+			config.KindReceiver: p.ReceiversNode, config.KindProcessor: p.ProcessorsNode, config.KindExporter: p.ExportersNode,
+		} {
+			dynamic[slot] = dynamic[slot] || IsExpansion(p.Node) || IsExpansion(node) || HasDynamicRefs(p.Refs(slot))
+		}
+	}
+
+	return dynamic
+}
+
 // Declared returns the component declared under the given kind.
 func (idx *Index) Declared(k config.Kind, id config.ID) (config.Component, bool) {
 	c, ok := idx.declared[k][id]
@@ -102,10 +126,25 @@ func (idx *Index) Declared(k config.Kind, id config.ID) (config.Component, bool)
 	return c, ok
 }
 
+// HasDynamicDeclarations reports whether a provider may supply declarations for
+// this service slot, including connectors in receiver and exporter slots.
+func (idx *Index) HasDynamicDeclarations(slot config.Kind) bool {
+	if sec := idx.File.Sections[slot]; sec != nil && IsExpansion(sec.Node) {
+		return true
+	}
+
+	return (slot == config.KindReceiver || slot == config.KindExporter) &&
+		idx.HasDynamicDeclarations(config.KindConnector)
+}
+
 // Resolve finds the declaration backing a reference from a pipeline slot.
 // Receiver and exporter slots also accept connectors, which is how the
 // collector wires two pipelines together.
 func (idx *Index) Resolve(slot config.Kind, id config.ID) (config.Component, bool) {
+	if HasExpansion(id.String()) {
+		return config.Component{}, false
+	}
+
 	if c, ok := idx.declared[slot][id]; ok {
 		return c, true
 	}
@@ -121,12 +160,33 @@ func (idx *Index) Resolve(slot config.Kind, id config.ID) (config.Component, boo
 
 // Used reports whether a declared component is referenced by the service
 // block, or, for an extension, by another component's settings.
-func (idx *Index) Used(k config.Kind, id config.ID) bool { return idx.used[k][id] }
+func (idx *Index) Used(k config.Kind, id config.ID) bool { return idx.used[k].Has(id) }
+
+// HasDynamicRefs reports whether unresolved service references may select a
+// component of this kind. It does not establish that any component is used.
+func (idx *Index) HasDynamicRefs(k config.Kind) bool {
+	if k == config.KindConnector {
+		return idx.dynamic[config.KindReceiver] || idx.dynamic[config.KindExporter]
+	}
+
+	return idx.dynamic[k]
+}
+
+// HasDynamicRefs reports whether a reference list contains a provider expansion.
+func HasDynamicRefs(refs []config.Ref) bool {
+	for _, ref := range refs {
+		if HasExpansion(ref.ID.String()) {
+			return true
+		}
+	}
+
+	return false
+}
 
 // Enabled reports whether service.extensions lists the extension, which is
 // what makes the collector instantiate it. An extension can be referenced
 // without being enabled, and then it never runs.
-func (idx *Index) Enabled(id config.ID) bool { return idx.enabled[id] }
+func (idx *Index) Enabled(id config.ID) bool { return idx.enabled.Has(id) }
 
 // ExtensionRefs returns the extension references written inside component
 // settings, such as an exporter's sending_queue.storage.
@@ -153,10 +213,10 @@ func (idx *Index) KindOf(id config.ID) (config.Kind, bool) {
 
 func (idx *Index) markUsed(k config.Kind, id config.ID) {
 	if idx.used[k] == nil {
-		idx.used[k] = map[config.ID]bool{}
+		idx.used[k] = sets.New[config.ID]()
 	}
 
-	idx.used[k][id] = true
+	idx.used[k].Insert(id)
 }
 
 // ExtensionRef is a reference to an extension written inside a component's
@@ -228,16 +288,20 @@ func extensionRefDocs(role string) string {
 // extensionRefs collects every extension reference in the file's component
 // settings, in declaration order.
 func extensionRefs(f *config.File, sch *schema.Schema) []ExtensionRef {
-	return lo.FlatMap(config.Kinds(), func(kind config.Kind, _ int) []ExtensionRef {
+	var refs []ExtensionRef
+
+	for _, kind := range config.Kinds() {
 		sec := f.Sections[kind]
 		if sec == nil {
-			return nil
+			continue
 		}
 
-		return lo.FlatMap(sec.Components, func(c config.Component, _ int) []ExtensionRef {
-			return componentExtensionRefs(c, settingsSchema(sch, kind, c))
-		})
-	})
+		for _, c := range sec.Components {
+			refs = append(refs, componentExtensionRefs(c, settingsSchema(sch, kind, c))...)
+		}
+	}
+
+	return refs
 }
 
 // settingsSchema is the field schema describing a component's settings, or nil
@@ -303,7 +367,7 @@ func (w *refWalker) walkMap(field *schema.Field, n *yaml.Node, path string, dept
 		child := childSchema(field, e.Key)
 
 		if child != nil && child.ExtensionRef != "" {
-			if name, named := ScalarName(e.Node).Get(); named {
+			if name, named := ScalarName(e.Node); named {
 				w.record(name, e.Path, child.ExtensionRef)
 			}
 
@@ -313,10 +377,15 @@ func (w *refWalker) walkMap(field *schema.Field, n *yaml.Node, path string, dept
 		// The built-in pair reaches a level further down than the marker does,
 		// so it is skipped where the schema marks the leaf itself; taking both
 		// would report the same name twice.
-		builtin, held := lo.Find(fields, func(f extensionField) bool { return f.parent == e.Key })
-		if held && !marked(child, builtin.key) {
-			if name, named := ScalarChild(e.Node, builtin.key).Get(); named {
-				w.record(name, JoinPath(e.Path, builtin.key), builtin.role)
+		for _, builtin := range fields {
+			if builtin.parent == e.Key {
+				if !marked(child, builtin.key) {
+					if name, named := ScalarChild(e.Node, builtin.key); named {
+						w.record(name, JoinPath(e.Path, builtin.key), builtin.role)
+					}
+				}
+
+				break
 			}
 		}
 

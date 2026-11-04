@@ -235,6 +235,43 @@ func TestEmptyDocumentIsNotAnError(t *testing.T) {
 	}
 }
 
+func TestParseTakesOneDocument(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, src, wantError string
+	}{
+		{name: "single", src: "service: {}\n", wantError: ""},
+		{name: "comments", src: "service: {}\n# trailing comment\n", wantError: ""},
+		{name: "document end", src: "service: {}\n...\n", wantError: ""},
+		{name: "valid second", src: "service: {}\n---\nservice: {}\n", wantError: "more than one document"},
+		{name: "empty second", src: "service: {}\n---\n", wantError: "more than one document"},
+		{name: "malformed second", src: "service: {}\n---\nthis is: [broken\n", wantError: "expected"},
+		{name: "empty first", src: "---\n---\nservice: {}\n", wantError: "more than one document"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f, err := config.Parse("config.yaml", []byte(tt.src))
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				assert.NotNil(t, f.Root)
+
+				return
+			}
+
+			require.ErrorContains(t, err, tt.wantError)
+			assert.Nil(t, f)
+
+			var syn *config.SyntaxError
+			require.ErrorAs(t, err, &syn)
+			assert.Equal(t, "config.yaml", syn.Path)
+			assert.GreaterOrEqual(t, syn.Line, 2)
+			assert.Equal(t, "yaml-syntax", syn.Diagnostic().Rule)
+		})
+	}
+}
+
 func TestParseID(t *testing.T) {
 	t.Parallel()
 
@@ -254,5 +291,85 @@ func TestParseID(t *testing.T) {
 		if got.String() != tt.in {
 			t.Errorf("round trip of %q gave %q", tt.in, got.String())
 		}
+	}
+}
+
+func TestParseIDTrimsEachPart(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, config.ID{Type: "otlp", Name: "internal"}, config.ParseID(" otlp / internal "))
+	assert.Equal(t, config.ID{Type: "otlp"}, config.ParseID(" otlp "))
+}
+
+func TestExplicitScalarTags(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, value string
+		valid       bool
+	}{
+		{name: "invalid int", value: "!!int banana", valid: false},
+		{name: "invalid bool", value: "!!bool banana", valid: false},
+		{name: "invalid float", value: "!!float banana", valid: false},
+		{name: "invalid binary", value: "!!binary '%not-base64'", valid: false},
+		{name: "invalid timestamp", value: "!!timestamp banana", valid: false},
+		{name: "valid int", value: "!!int 0x10", valid: true},
+		{name: "valid bool", value: "!!bool true", valid: true},
+		{name: "valid float", value: "!!float 1.5", valid: true},
+		{name: "valid binary", value: "!!binary YQ==", valid: true},
+		{name: "quoted string", value: "!!str banana", valid: true},
+		{name: "custom tag", value: "!custom banana", valid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f, err := config.Parse("tag.yaml", []byte("value: "+tt.value+"\n"))
+			if tt.valid {
+				require.NoError(t, err)
+				require.NotNil(t, f)
+
+				return
+			}
+
+			var syn *config.SyntaxError
+
+			require.ErrorAs(t, err, &syn)
+			assert.Nil(t, f)
+			assert.Equal(t, "tag.yaml", syn.Path)
+			assert.Equal(t, 1, syn.Line)
+			assert.Equal(t, 8, syn.Column)
+			assert.Equal(t, "yaml-syntax", syn.Diagnostic().Rule)
+		})
+	}
+}
+
+func TestParseRejectsComplexMappingKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, src string
+		valid     bool
+	}{
+		{name: "sequence", src: "exporters: {debug: {? [verbosity]: basic}}", valid: false},
+		{name: "mapping", src: "exporters: {debug: {? {verbosity: basic}: basic}}", valid: false},
+		{name: "sequence alias", src: "anchor: &key [verbosity]\nexporters: {debug: {? *key: basic}}", valid: false},
+		{name: "scalar alias", src: "anchor: &key verbosity\nexporters: {debug: {? *key: basic}}", valid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse("config.yaml", []byte(tt.src))
+			if tt.valid {
+				require.NoError(t, err)
+
+				return
+			}
+
+			var syn *config.SyntaxError
+			require.ErrorAs(t, err, &syn)
+			assert.Contains(t, syn.Msg, "map key")
+			assert.Positive(t, syn.Line)
+			assert.Positive(t, syn.Column)
+		})
 	}
 }

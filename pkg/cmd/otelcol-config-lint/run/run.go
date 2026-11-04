@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/cmdutil"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/config"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/lint"
 	"github.com/minuk-dev/otelcol-config-lint/pkg/ruleset"
@@ -104,6 +105,7 @@ type options struct {
 	failOn           string
 	concurrency      int
 	strict           bool
+	embedded         bool
 	ignoreMissing    bool
 	summary          bool
 	verbose          bool
@@ -113,16 +115,16 @@ type options struct {
 	// internal state
 	// store is where the schemas are read from.
 	store schema.Store
-	// resolved is which rules run and at what level, once the flags and the
-	// file have both had their say and every name has been held to the rules
-	// that exist.
-	resolved ruleset.Resolved
+	// selection combines rule flags with the settings file.
+	selection  ruleset.Selection
+	rulePolicy func(string) map[string]diag.Severity
 	// envPolicy resolves the environment of each file linted.
 	envPolicy lint.EnvironmentPolicy
 	// kubernetesEnabled is what the flag or the settings file said about
 	// running in Kubernetes; nil when neither said anything, which leaves the
 	// answer to be read from the memory numbers.
 	kubernetesEnabled *bool
+	hostNetwork       *bool
 	// kubernetesOverrides are the per-path environments, which only the
 	// settings file can state.
 	kubernetesOverrides []settings.KubernetesOverride
@@ -148,12 +150,23 @@ The policy itself belongs in ` + settings.DefaultName + `, which is read from
 this directory or any parent above it; every flag here mirrors one of its keys.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			err := opts.prepare(cmd)
+			err := cmd.Context().Err()
+			if err != nil {
+				return fmt.Errorf("lint cancelled: %w", err)
+			}
+
+			err = opts.prepare(cmd)
 			if err != nil {
 				return err
 			}
 
 			err = opts.run(cmd, args)
+
+			ctxErr := cmd.Context().Err()
+			if ctxErr != nil {
+				return fmt.Errorf("lint cancelled: %w", ctxErr)
+			}
+
 			if err != nil {
 				return err
 			}
@@ -213,6 +226,7 @@ func (o *options) declareFlags(cmd *cobra.Command) {
 	// shorthand: it is what the documentation and every existing workflow use.
 	flags.IntVarP(&o.concurrency, "concurrency", "n", defaultWorkers(), "number of files to check in parallel")
 	flags.BoolVar(&o.strict, "strict", false, "report unknown component settings as errors")
+	flags.BoolVar(&o.embedded, "embedded", false, "lint collector configs in Kubernetes ConfigMap data blocks")
 	flags.BoolVar(&o.ignoreMissing, "ignore-missing-schemas", false,
 		"do not fail on components missing from the schema")
 	flags.BoolVar(&o.summary, "summary", false, "print a summary of the results")
@@ -241,8 +255,7 @@ func (o *options) prepare(cmd *cobra.Command) error {
 	fold.Str("memory-request", &o.memoryRequest, file.Run.Kubernetes.MemoryRequest)
 	fold.Str("memory-limit", &o.memoryLimit, file.Run.Kubernetes.MemoryLimit)
 
-	// The deployment environment is a tri-state: the flag wins, then the file,
-	// and with neither the memory numbers speak for themselves.
+	// The environment is a tri-state: flag, file, then memory numbers.
 	switch {
 	case fold.Changed("kubernetes"):
 		o.kubernetesEnabled = &o.kubernetes
@@ -251,17 +264,9 @@ func (o *options) prepare(cmd *cobra.Command) error {
 	}
 
 	o.kubernetesOverrides = file.Run.Kubernetes.Overrides
+	o.hostNetwork = file.Run.Kubernetes.HostNetwork
 
-	// The rules are resolved here rather than at the first lint, so a rule
-	// named that does not exist is reported where every other bad flag is.
-	o.resolved, err = ruleset.Resolve(file.RuleSelection(ruleset.Selection{
-		Default:  o.ruleDefault,
-		Enable:   o.enable,
-		Disable:  o.disable,
-		Severity: o.severity,
-		// Per-rule settings are the file's alone, which RuleSelection carries.
-		Settings: nil,
-	}))
+	err = o.prepareRules(file)
 	if err != nil {
 		return err
 	}
@@ -271,7 +276,7 @@ func (o *options) prepare(cmd *cobra.Command) error {
 		Distribution:  o.distribution,
 		AllowInsecure: o.insecureSchemaLocation,
 		NoCache:       o.noCache,
-		Fs:            o.FS(),
+		Fs:            o.Fs,
 	}
 
 	// A location the store will refuse is a bad flag, so it is reported here
@@ -314,6 +319,7 @@ func (o *options) run(cmd *cobra.Command, args []string) error {
 // environment groups fold their own, and the rule lists merge rather than
 // replace, which rulepolicy does.
 func (o *options) applySettings(s *settings.File, fold settings.Fold) {
+	fold.Bool("embedded", &o.embedded, s.Run.Embedded)
 	fold.Str("collector-version", &o.collectorVersion, s.Run.CollectorVersion)
 	fold.Str("output", &o.output, s.Output.Format)
 	fold.Str("min-severity", &o.minSeverity, s.Issues.MinSeverity)
@@ -343,6 +349,11 @@ func (o *options) runLint(cmd *cobra.Command, paths []string) error {
 	files, err := sc.Scan(paths)
 	if err != nil {
 		return fmt.Errorf("collect files: %w", err)
+	}
+
+	err = cmd.Context().Err()
+	if err != nil {
+		return fmt.Errorf("lint cancelled: %w", err)
 	}
 
 	if files.Len() == 0 {
@@ -381,38 +392,41 @@ func (o *options) lintAll(
 ) error {
 	var summary lint.Summary
 
-	// Results are buffered so output stays in path order even though the files
-	// are checked concurrently.
+	// Regular runs buffer results to preserve path order. Early-exit runs check
+	// one file at a time so no later work has to be canceled.
 	results := make(map[string]lint.Result, files.Len())
 
 	if files.Has(scanner.StdinMarker) {
-		results[scanner.StdinMarker] = linter.LintReader(cmd.Context(), "stdin", cmd.InOrStdin())
+		results[scanner.StdinMarker] = lintStdin(cmd, linter)
 	}
 
-	onDisk := sets.List(files.Difference(sets.New(scanner.StdinMarker)))
-	for r := range linter.LintAll(cmd.Context(), onDisk, o.concurrency) {
-		results[r.Path] = r
-	}
+	if !o.exitOnError {
+		onDisk := sets.List(files.Difference(sets.New(scanner.StdinMarker)))
 
-	// An environment decides whether some rules run at all, so a verbose run
-	// says which one each file resolved to.
-	sayEnvironment := o.verbose && o.envPolicy.Configured()
+		batch, err := linter.LintAll(cmd.Context(), onDisk, o.concurrency)
+		if err != nil {
+			return err
+		}
+
+		for _, r := range batch {
+			results[r.Path] = r
+		}
+	}
 
 	for _, f := range sets.List(files) {
 		r := results[f]
+		if o.exitOnError && f != scanner.StdinMarker {
+			r = linter.LintFile(cmd.Context(), f)
+		}
+
+		err := o.reportResult(cmd, formatter, r, f)
+		if err != nil {
+			return err
+		}
 
 		summary.Add(r)
 
-		if sayEnvironment {
-			cmd.PrintErrf("otelcol-config-lint: %s: %s\n", r.Path, describeEnvironment(o.envPolicy.Resolve(r.Path)))
-		}
-
-		err := formatter.Result(r)
-		if err != nil {
-			return fmt.Errorf("report %s: %w", r.Path, err)
-		}
-
-		if o.exitOnError && (r.Status == lint.Invalid || r.Status == lint.Error) {
+		if o.exitOnError && summary.Failed() {
 			break
 		}
 	}
@@ -429,12 +443,42 @@ func (o *options) lintAll(
 	return nil
 }
 
-func (o *options) newLinter(cmd *cobra.Command) (*lint.Linter, error) {
-	cat, err := o.loadSchema(cmd)
-	if err != nil {
-		return nil, err
+// lintStdin uses the policy marker while checking and the display name only when reporting.
+func lintStdin(cmd *cobra.Command, linter *lint.Linter) lint.Result {
+	result := linter.LintReader(cmd.Context(), scanner.StdinMarker, cmd.InOrStdin())
+	result.Path = "stdin"
+
+	for i := range result.Diagnostics {
+		result.Diagnostics[i].Position.File = result.Path
 	}
 
+	var syntax *config.SyntaxError
+	if errors.As(result.Err, &syntax) {
+		syntax.Path = result.Path
+	}
+
+	return result
+}
+
+func (o *options) reportResult(cmd *cobra.Command, formatter lint.Formatter, r lint.Result, policyPath string) error {
+	err := cmd.Context().Err()
+	if err != nil {
+		return fmt.Errorf("lint cancelled: %w", err)
+	}
+
+	if o.verbose && o.envPolicy.Configured() {
+		cmd.PrintErrf("otelcol-config-lint: %s: %s\n", r.Path, describeEnvironment(o.envPolicy.Resolve(policyPath)))
+	}
+
+	err = formatter.Result(r)
+	if err != nil {
+		return fmt.Errorf("report %s: %w", r.Path, err)
+	}
+
+	return nil
+}
+
+func (o *options) newLinter(cmd *cobra.Command) (*lint.Linter, error) {
 	minSeverity, err := diag.ParseSeverity(o.minSeverity)
 	if err != nil {
 		return nil, fmt.Errorf("--min-severity: %w", err)
@@ -445,53 +489,37 @@ func (o *options) newLinter(cmd *cobra.Command) (*lint.Linter, error) {
 		return nil, fmt.Errorf("--fail-on: %w", err)
 	}
 
-	return lint.New(lint.Options{
-		Schema:               cat,
+	linter, target, err := lint.Prepare(cmd.Context(), lint.PrepareOptions{
+		Store:                o.store,
+		CollectorVersion:     o.collectorVersion,
+		AllowNearestFallback: o.allowNearestFallback,
 		Fs:                   o.FS(),
-		Availability:         lint.NewVersionIndex(o.store),
-		Distributions:        lint.NewDistributionIndex(o.store, cat.CollectorVersion),
-		Rules:                o.resolved.Rules,
-		Severities:           o.resolved.Severities,
+		Rules:                o.selection,
+		RulePolicy:           o.rulePolicy,
 		Environment:          o.envPolicy.Resolve,
 		Strict:               o.strict,
+		Embedded:             o.embedded,
 		IgnoreMissingSchemas: o.ignoreMissing,
 		MinSeverity:          minSeverity,
 		FailOn:               failOn,
-	}), nil
-}
-
-// loadSchema resolves the targeted release.
-//
-// A release the registry does not carry ends the run: the exit code is the
-// only thing CI reads, and a run that silently checked the config against some
-// other release passed green while saying nothing an annotation would carry.
-// The nearest release is named instead, so the fix is one edit away, and
-// --allow-nearest-fallback checks against it for a run that is deliberately
-// tracking ahead of the registry.
-func (o *options) loadSchema(cmd *cobra.Command) (*schema.Schema, error) {
-	cat, err := o.store.Load(cmd.Context(), o.collectorVersion)
-	if err == nil {
-		return cat, nil
+	})
+	if target.Fallback {
+		cmd.PrintErrf("otelcol-config-lint: no schema for %s, falling back to %s\n",
+			target.RequestedVersion, target.CollectorVersion)
 	}
 
 	var unknown *schema.UnknownVersionError
-	if !errors.As(err, &unknown) {
-		return nil, fmt.Errorf("load schema: %w", err)
-	}
+	if !target.Fallback && errors.As(err, &unknown) {
+		near, hasNear := unknown.Nearest()
 
-	near, hasNear := unknown.Nearest()
-	if !hasNear || !o.allowNearestFallback {
 		return nil, &NoExactSchemaError{Err: unknown, Nearest: near, HasNearest: hasNear}
 	}
 
-	cmd.PrintErrf("otelcol-config-lint: no schema for %s, falling back to %s\n", unknown.Version, near)
-
-	cat, err = o.store.Load(cmd.Context(), near)
-	if err != nil {
-		return nil, fmt.Errorf("load schema %s: %w", near, err)
+	if errors.Is(err, lint.ErrEmptySchema) {
+		return nil, fmt.Errorf("%w; check --schema-location and replace or regenerate the schema", err)
 	}
 
-	return cat, nil
+	return linter, err
 }
 
 func defaultWorkers() int {
@@ -500,4 +528,24 @@ func defaultWorkers() int {
 	}
 
 	return maxDefaultWorkers
+}
+
+func (o *options) prepareRules(file *settings.File) error {
+	// The rules are validated here rather than at the first lint, so a rule
+	// named that does not exist is reported where every other bad flag is.
+	o.selection = file.RuleSelection(ruleset.Selection{
+		Default: o.ruleDefault, Enable: o.enable, Disable: o.disable, Severity: o.severity,
+	})
+
+	_, err := ruleset.Resolve(o.selection)
+	if err != nil {
+		return err
+	}
+
+	o.rulePolicy, err = file.RulePolicy(ruleset.Selection{Enable: o.enable, Disable: o.disable, Severity: o.severity})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

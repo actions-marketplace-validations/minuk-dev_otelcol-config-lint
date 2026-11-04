@@ -101,6 +101,143 @@ func TestCleanConfigIsQuiet(t *testing.T) {
 	}
 }
 
+func TestDynamicServiceReferences(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct{ name, from, to string }{
+		{"receiver", "receivers: [otlp]", `receivers: ["${env:RECEIVER_ID}"]`},
+		{"receiver list", "receivers: [otlp]", `receivers: ${env:RECEIVERS}`},
+		{"processor list", "processors: [memory_limiter, batch]", `processors: ${env:PROCESSORS}`},
+		{"exporter list", "exporters: [otlp]", `exporters: ${env:EXPORTERS}`},
+		{"extension list", "extensions: [zpages]", `extensions: ${env:EXTENSIONS}`},
+		{"processors", "processors: [memory_limiter, batch]", `processors: ["${env:PROCESSOR_ID}"]`},
+		{"exporter", "exporters: [otlp]", `exporters: ["${env:EXPORTER_ID}"]`},
+		{"extension", "extensions: [zpages]", `extensions: ["${env:EXTENSION_ID}"]`},
+		{"embedded provider", "receivers: [otlp]", `receivers: ["otlp/${file:receiver-name.txt}"]`},
+		{"default", "receivers: [otlp]", `receivers: ["${env:RECEIVER_ID:-otlp}"]`},
+		{"shorthand", "receivers: [otlp]", `receivers: ["$RECEIVER_ID"]`},
+		{"mixed known and dynamic", "receivers: [otlp]", `receivers: [otlp, "${env:RECEIVER_ID}"]`},
+		{"repeated provider", "receivers: [otlp]", `receivers: ["${env:ID}", "${env:ID}"]`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Empty(t, check(t, strings.Replace(ruletest.Clean, tt.from, tt.to, 1)))
+		})
+	}
+}
+
+func TestDynamicPipelineStructures(t *testing.T) {
+	t.Parallel()
+
+	declarations, _, found := strings.Cut(ruletest.Clean, "service:")
+	require.True(t, found)
+
+	for _, tt := range []struct{ name, service string }{
+		{"service", "service: ${env:SERVICE}"},
+		{"pipelines", "service: {extensions: [zpages], pipelines: '${env:PIPELINES}'}"},
+		{"pipeline", "service: {extensions: [zpages], pipelines: {traces: '${env:PIPELINE}'}}"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Empty(t, check(t, declarations+tt.service))
+		})
+	}
+
+	// An unresolved sibling cannot hide a missing end in a literal pipeline.
+	src := declarations + `service:
+  extensions: [zpages]
+  pipelines:
+    traces: ${env:PIPELINE}
+    traces/broken: {receivers: [otlp]}
+`
+	foundEnds := checkRule(t, "empty-pipeline", src)
+	require.Len(t, foundEnds, 1)
+	assert.Equal(t, "service.pipelines.traces/broken.exporters", foundEnds[0].Path)
+}
+
+func TestDynamicReferencesPreserveLiteralChecks(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct{ name, from, to, path string }{
+		{"receiver", "receivers: [otlp]", `receivers: ["${env:ID}", missing]`,
+			"service.pipelines.traces.receivers[1]"},
+		{"processor", "processors: [memory_limiter, batch]", `processors: ["${env:ID}", missing]`,
+			"service.pipelines.traces.processors[1]"},
+		{"exporter", "exporters: [otlp]", `exporters: ["${env:ID}", missing]`,
+			"service.pipelines.traces.exporters[1]"},
+		{"extension", "extensions: [zpages]", `extensions: ["${env:ID}", missing]`,
+			"service.extensions[1]"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := strings.Replace(ruletest.Clean, tt.from, tt.to, 1)
+			found := checkRule(t, "undefined-reference", src)
+			require.Len(t, found, 1)
+			assert.Contains(t, found[0].Message, `"missing"`)
+			assert.Equal(t, tt.path, found[0].Path)
+			assert.Equal(t, diag.Error, found[0].Severity)
+		})
+	}
+
+	src := strings.Replace(ruletest.Clean, "receivers: [otlp]", `receivers: ["${env:ID}", otlp, otlp]`, 1)
+	assert.Len(t, checkRule(t, "duplicate-reference", src), 1)
+
+	// Unknown receiver usage must not hide a definitely unused exporter.
+	src = strings.Replace(ruletest.Clean, "receivers: [otlp]", `receivers: ["${env:ID}"]`, 1)
+	src = strings.Replace(src, "exporters:\n", "exporters:\n  debug:\n", 1)
+	found := checkRule(t, "unused-component", src)
+	require.Len(t, found, 1)
+	assert.Equal(t, "exporters.debug", found[0].Path)
+}
+
+func TestDynamicExtensionEnablement(t *testing.T) {
+	t.Parallel()
+
+	src := strings.Replace(ruletest.Clean, "extensions: [zpages]", `extensions: ["${env:ID}"]`, 1)
+	src = strings.Replace(src, "endpoint: backend:4317",
+		"endpoint: backend:4317\n    auth:\n      authenticator: zpages", 1)
+	assert.Empty(t, checkRule(t, "undefined-extension-reference", src))
+
+	src = strings.Replace(src, "authenticator: zpages", "authenticator: missing", 1)
+	found := checkRule(t, "undefined-extension-reference", src)
+	require.Len(t, found, 1)
+	assert.Contains(t, found[0].Message, "not declared under extensions")
+}
+
+func TestDynamicConnectorWiring(t *testing.T) {
+	t.Parallel()
+
+	src := `
+receivers: {otlp: }
+exporters: {debug: }
+connectors: {spanmetrics: }
+service:
+  pipelines:
+    traces: {receivers: [otlp], exporters: ["${env:ID}"]}
+    metrics: {receivers: [spanmetrics], exporters: [debug]}
+`
+	assert.Empty(t, checkRule(t, "connector-wiring", src))
+	assert.Empty(t, checkRule(t, "unused-component", src))
+
+	wholeList := strings.Replace(src, `exporters: ["${env:ID}"]`, `exporters: "${env:EXPORTERS}"`, 1)
+	assert.Empty(t, checkRule(t, "connector-wiring", wholeList))
+	assert.Empty(t, checkRule(t, "unused-component", wholeList))
+
+	src = strings.Replace(src, `exporters: ["${env:ID}"]`, "exporters: [spanmetrics]", 1)
+	src = strings.Replace(src, "receivers: [spanmetrics]", `receivers: ["${env:ID}"]`, 1)
+	assert.Empty(t, checkRule(t, "connector-wiring", src))
+
+	src = strings.Replace(src, `receivers: ["${env:ID}"]`, "receivers: [otlp]", 1)
+	assert.Len(t, checkRule(t, "connector-wiring", src), 1)
+
+	// A dynamic alternative does not undo a loop between literal references.
+	src = strings.Replace(src, "receivers: [otlp]", `receivers: [otlp, spanmetrics, "${env:ID}"]`, 1)
+	assert.Len(t, checkRule(t, "connector-wiring", src), 1)
+}
+
 func TestRules(t *testing.T) {
 	t.Parallel()
 
@@ -347,13 +484,13 @@ service:
 			want: "invalid-value",
 		},
 		{
-			name: "duration written as a bare number",
+			name: "duration written as a quoted unitless number",
 			src: `
 receivers: {otlp: }
 exporters:
   otlp:
     endpoint: backend:4317
-    timeout: 5
+    timeout: "5"
 service:
   pipelines:
     traces: {receivers: [otlp], exporters: [otlp]}
@@ -817,14 +954,13 @@ func TestFindingsCiteUpstream(t *testing.T) {
 	}
 }
 
-// TestNoBuiltInRuleTakesSettingsYet records where rules.settings stands: the
-// schema is there for the rules that will want it, and no rule in the set reads
-// a block. When the first one does, this test is the reminder to document it.
-func TestNoBuiltInRuleTakesSettingsYet(t *testing.T) {
+// TestBuiltInRuleSettingsAreDocumented keeps new configurable rules from
+// shipping without a documented settings block.
+func TestBuiltInRuleSettingsAreDocumented(t *testing.T) {
 	t.Parallel()
 
 	for _, r := range ruleset.All() {
-		if _, ok := r.(rule.Configurable); ok {
+		if _, ok := r.(rule.Configurable); ok && r.Name() != "missing-batch" && r.Name() != "component-stability" {
 			t.Errorf("%s now takes settings -- document its block under rules.settings", r.Name())
 		}
 	}
@@ -934,10 +1070,22 @@ func TestAMergedValueIsStillChecked(t *testing.T) {
 
 	found := checkRule(t, "invalid-value", src)
 	require.Len(t, found, 2, "the anchor and the exporter that merges it both carry the value")
+	assert.Equal(t, 10, found[0].Position.Line)
+	assert.Equal(t, found[0].Position, found[1].Position, "both findings retain the merged value's position")
 
 	paths := []string{found[0].Path, found[1].Path}
 	assert.Contains(t, paths, "exporters.otlp.timeout",
 		"the exporter that merges the value should be reported, not only the anchor it came from")
+}
+
+func TestAliasedValuesKeepSchemaContext(t *testing.T) {
+	t.Parallel()
+
+	src := "exporters:\n  otlp:\n    endpoint: &shared backend:4317\n    timeout: *shared\n"
+	found := checkRule(t, "invalid-value", src)
+	require.Len(t, found, 1)
+	assert.Equal(t, "exporters.otlp.timeout", found[0].Path)
+	assert.Equal(t, diag.Position{File: "test.yaml", Line: 3, Column: 15}, found[0].Position)
 }
 
 // TestWrongNodeTypeReportsWhatAnAliasResolvesTo pins that resolution does not
@@ -950,4 +1098,45 @@ func TestWrongNodeTypeReportsWhatAnAliasResolvesTo(t *testing.T) {
 	found := checkRule(t, "wrong-node-type", "_base: &base not-a-mapping\nreceivers: *base\n")
 	require.Len(t, found, 1)
 	assert.Contains(t, found[0].Message, "got a scalar")
+}
+
+func TestDynamicComponentDeclarations(t *testing.T) {
+	t.Parallel()
+
+	for _, section := range []string{"receivers", "processors", "exporters", "extensions", "connectors"} {
+		t.Run(section, func(t *testing.T) {
+			t.Parallel()
+
+			src := `receivers: {otlp: }
+processors: {batch: }
+exporters: {otlp: {endpoint: localhost:4317, auth: {authenticator: zpages}}}
+extensions: {zpages: }
+connectors: {spanmetrics: }
+service:
+  extensions: [zpages]
+  pipelines:
+    traces: {receivers: [otlp], processors: [batch], exporters: [otlp, spanmetrics]}
+    metrics: {receivers: [spanmetrics], exporters: [otlp]}
+`
+			start := strings.Index(src, section+":")
+			end := start + strings.Index(src[start:], "\n")
+
+			src = src[:start] + section + ": ${env:COMPONENTS}" + src[end:]
+			for _, name := range []string{"wrong-node-type", "undefined-reference", "undefined-extension-reference"} {
+				assert.Empty(t, checkRule(t, name, src), name)
+			}
+			// Unknown declarations in one section do not hide missing processors elsewhere.
+			if section != "processors" {
+				bad := strings.Replace(src, "processors: [batch]", "processors: [missing]", 1)
+				assert.Len(t, checkRule(t, "undefined-reference", bad), 1)
+			}
+
+			if section == "extensions" {
+				bad := strings.Replace(src, "extensions: [zpages]", "extensions: []", 1)
+				found := checkRule(t, "undefined-extension-reference", bad)
+				require.Len(t, found, 1)
+				assert.Contains(t, found[0].Message, "missing from service.extensions")
+			}
+		})
+	}
 }

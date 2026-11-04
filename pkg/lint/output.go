@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/minuk-dev/otelcol-config-lint/pkg/diag"
+	"github.com/minuk-dev/otelcol-config-lint/pkg/sets"
 )
 
 // Formatter renders results as they arrive and writes a trailer at the end.
@@ -55,7 +57,7 @@ type FormatterOptions struct {
 func NewFormatter(name string, w io.Writer, opts FormatterOptions) (Formatter, error) {
 	switch name {
 	case "", "text":
-		return &textFormatter{w: w, opts: opts}, nil
+		return &textFormatter{w: w, opts: opts, ruleCounts: map[string]int{}}, nil
 	case "json":
 		return &jsonFormatter{w: w, opts: opts, rep: jsonReport{Files: nil, Summary: Summary{}}}, nil
 	case "junit":
@@ -63,7 +65,7 @@ func NewFormatter(name string, w io.Writer, opts FormatterOptions) (Formatter, e
 	case "tap":
 		return &tapFormatter{w: w, opts: opts, lines: nil, n: 0}, nil
 	case "github":
-		return &githubFormatter{w: w, opts: opts}, nil
+		return &githubFormatter{w: w, opts: opts, annotations: nil}, nil
 	default:
 		return nil, fmt.Errorf("%w %q (want text, json, junit, tap or github)", ErrUnknownFormat, name)
 	}
@@ -84,8 +86,9 @@ const (
 )
 
 type textFormatter struct {
-	w    io.Writer
-	opts FormatterOptions
+	w          io.Writer
+	opts       FormatterOptions
+	ruleCounts map[string]int
 }
 
 func (f *textFormatter) Result(r Result) error {
@@ -95,17 +98,11 @@ func (f *textFormatter) Result(r Result) error {
 
 		return err
 	case Skipped:
-		if !f.opts.Verbose {
-			return nil
-		}
-
-		err := writef(f.w, "%s: %s\n", r.Path, f.color(ansiDim, "skipped"))
-
-		return err
+		return f.skipped(r)
 	case Invalid:
 		// Diagnostics are printed below.
 	case Valid:
-		if len(r.Diagnostics) == 0 {
+		if len(r.Diagnostics) == 0 && (r.Coverage == nil || r.Coverage.Status == coverageComplete) {
 			if !f.opts.Verbose {
 				return nil
 			}
@@ -121,6 +118,14 @@ func (f *textFormatter) Result(r Result) error {
 		if err != nil {
 			return err
 		}
+
+		if f.opts.Summary {
+			f.ruleCounts[d.Rule]++
+		}
+	}
+
+	if r.Coverage != nil && r.Coverage.Status != coverageComplete {
+		return writef(f.w, "%s: %s\n", r.Path, r.Coverage.description())
 	}
 
 	return nil
@@ -133,9 +138,35 @@ func (f *textFormatter) Finish(s Summary) error {
 
 	total := s.Valid + s.Invalid + s.Errors + s.Skipped
 
-	return writef(f.w,
+	err := writef(f.w,
 		"Summary: %d file(s) checked, %d valid, %d invalid, %d error(s), %d skipped (%d warning(s), %d info)\n",
 		total, s.Valid, s.Invalid, s.Errors, s.Skipped, s.Warnings, s.Infos)
+	if err != nil {
+		return err
+	}
+
+	if s.Incomplete > 0 {
+		err = writef(f.w, "Validation coverage incomplete for %d file(s); validity only reflects enabled rules.\n",
+			s.Incomplete)
+		if err != nil {
+			return err
+		}
+	}
+
+	return f.ruleSummary()
+}
+
+func (f *textFormatter) skipped(r Result) error {
+	if !f.opts.Verbose {
+		return nil
+	}
+
+	message := "skipped"
+	if r.SkipReason != "" {
+		message += ": " + r.SkipReason
+	}
+
+	return writef(f.w, "%s: %s\n", r.Path, f.color(ansiDim, message))
 }
 
 func (f *textFormatter) color(code, s string) string {
@@ -185,6 +216,7 @@ type jsonFile struct {
 	Status      Status           `json:"status"`
 	Message     string           `json:"msg,omitempty"`
 	Diagnostics diag.Diagnostics `json:"diagnostics,omitempty"`
+	Coverage    *Coverage        `json:"coverage,omitempty"`
 }
 
 type jsonFormatter struct {
@@ -194,12 +226,12 @@ type jsonFormatter struct {
 }
 
 func (f *jsonFormatter) Result(r Result) error {
-	if r.Status == Valid && len(r.Diagnostics) == 0 && !f.opts.Verbose {
+	if r.Status == Valid && len(r.Diagnostics) == 0 && r.Coverage == nil && !f.opts.Verbose {
 		return nil
 	}
 
 	f.rep.Files = append(f.rep.Files, jsonFile{
-		Filename: r.Path, Status: r.Status, Message: r.Message(), Diagnostics: r.Diagnostics,
+		Filename: r.Path, Status: r.Status, Message: r.Message(), Diagnostics: r.Diagnostics, Coverage: r.Coverage,
 	})
 
 	return nil
@@ -253,17 +285,25 @@ type junitFailure struct {
 func (f *junitFormatter) Result(r Result) error {
 	c := junitCase{Name: r.Path, ClassName: "otelcol-config-lint", Failures: nil, Error: nil}
 	if r.Status == Error {
-		c.Error = &junitFailure{Message: r.Message(), Type: "error", Text: ""}
+		c.Error = &junitFailure{Message: r.Message(), Type: string(Error), Text: ""}
 	}
 
 	for _, d := range r.Diagnostics {
-		if d.Severity != diag.Error {
+		if r.Status != Invalid {
 			continue
 		}
 
 		c.Failures = append(c.Failures, junitFailure{
 			Message: d.Message, Type: d.Rule,
 			Text: d.Position.String() + ": " + d.Message,
+		})
+	}
+
+	if r.Status == Invalid && len(c.Failures) == 0 {
+		c.Failures = append(c.Failures, junitFailure{
+			Message: "File failed the configured severity threshold; diagnostics were filtered out.",
+			Type:    string(Invalid),
+			Text:    "",
 		})
 	}
 
@@ -346,23 +386,31 @@ func (f *tapFormatter) Finish(Summary) error {
 // githubFormatter emits GitHub Actions workflow commands so findings show up as
 // inline annotations on a pull request.
 type githubFormatter struct {
-	w    io.Writer
-	opts FormatterOptions
+	w           io.Writer
+	opts        FormatterOptions
+	annotations []githubAnnotation
+}
+
+type githubAnnotation struct {
+	level, rule, file, message string
+	line, column               int
 }
 
 func (f *githubFormatter) Result(r Result) error {
 	if r.Status == Error {
-		err := writef(f.w, "::error file=%s::%s\n", r.Path, escapeGitHub(r.Message()))
+		f.annotations = append(f.annotations, githubAnnotation{
+			level: string(Error), rule: "", file: r.Path, message: r.Message(), line: 0, column: 0,
+		})
 
-		return err
+		return nil
 	}
 
 	for _, d := range r.Diagnostics {
-		level := "notice"
+		level := githubNotice
 
 		switch d.Severity {
 		case diag.Error:
-			level = "error"
+			level = string(Error)
 		case diag.Warning:
 			level = "warning"
 		case diag.Info, diag.Off:
@@ -378,28 +426,166 @@ func (f *githubFormatter) Result(r Result) error {
 			msg += "\ndocs: " + d.Docs
 		}
 
-		err := writef(f.w, "::%s file=%s,line=%d,col=%d::%s\n",
-			level, d.Position.File, d.Position.Line, d.Position.Column, escapeGitHub(msg))
-		if err != nil {
-			return err
-		}
+		f.annotations = append(f.annotations, githubAnnotation{
+			level: level, rule: d.Rule, file: d.Position.File,
+			line: d.Position.Line, column: d.Position.Column, message: msg,
+		})
 	}
 
 	return nil
 }
 
 func (f *githubFormatter) Finish(s Summary) error {
-	if !f.opts.Summary {
-		return nil
+	for _, level := range []string{string(Error), "warning", githubNotice} {
+		err := f.writeAnnotations(level)
+		if err != nil {
+			return err
+		}
 	}
 
-	err := writef(f.w, "::notice::%d valid, %d invalid, %d error(s)\n", s.Valid, s.Invalid, s.Errors)
+	if f.opts.Summary {
+		return writef(f.w, "::notice::%d valid, %d invalid, %d error(s)\n", s.Valid, s.Invalid, s.Errors)
+	}
 
-	return err
+	return nil
+}
+
+const (
+	githubAnnotationLimit = 10
+	githubNotice          = "notice"
+)
+
+func (f *githubFormatter) writeAnnotations(level string) error {
+	var candidates []githubAnnotation
+
+	for _, a := range f.annotations {
+		if a.level == level {
+			candidates = append(candidates, a)
+		}
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if a.rule != b.rule {
+			return a.rule < b.rule
+		}
+
+		if a.file != b.file {
+			return a.file < b.file
+		}
+
+		if a.line != b.line {
+			return a.line < b.line
+		}
+
+		return a.column < b.column
+	})
+
+	limit := len(candidates)
+	if level != githubNotice && limit > githubAnnotationLimit {
+		limit = githubAnnotationLimit
+	}
+
+	selected := pickAnnotations(candidates, limit)
+
+	for _, a := range selected {
+		err := f.writeAnnotation(a)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(selected) < len(candidates) {
+		return writef(f.w, "::notice::%d of %d %ss shown; run with --output text or json for all findings\n",
+			len(selected), len(candidates), level)
+	}
+
+	return nil
+}
+
+// pickAnnotations gives each file a slot, then each rule in each file, before
+// filling remaining slots by position.
+func pickAnnotations(candidates []githubAnnotation, limit int) []githubAnnotation {
+	const (
+		distinctFiles = iota
+		distinctRulesPerFile
+		remainingAnnotations
+	)
+
+	selected := make([]githubAnnotation, 0, limit)
+	used := make([]bool, len(candidates))
+	files := sets.New[string]()
+	groups := sets.New[string]()
+
+	for pass := distinctFiles; pass <= remainingAnnotations; pass++ {
+		for i, a := range candidates {
+			if used[i] || len(selected) == limit {
+				continue
+			}
+
+			group := a.rule + "\x00" + a.file
+			if (pass == distinctFiles && files.Has(a.file)) ||
+				(pass == distinctRulesPerFile && groups.Has(group)) {
+				continue
+			}
+
+			selected = append(selected, a)
+			used[i] = true
+
+			files.Insert(a.file)
+			groups.Insert(group)
+		}
+	}
+
+	return selected
+}
+
+func (f *githubFormatter) writeAnnotation(a githubAnnotation) error {
+	a.file = strings.NewReplacer(":", "%3A", ",", "%2C").Replace(escapeGitHub(a.file))
+	if a.line == 0 {
+		return writef(f.w, "::%s file=%s::%s\n", a.level, a.file, escapeGitHub(a.message))
+	}
+
+	return writef(f.w, "::%s file=%s,line=%d,col=%d::%s\n",
+		a.level, a.file, a.line, a.column, escapeGitHub(a.message))
 }
 
 // escapeGitHub encodes the characters that would otherwise end a workflow
 // command early.
 func escapeGitHub(s string) string {
 	return strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A").Replace(s)
+}
+
+// ruleSummary counts only diagnostics that Result actually rendered.
+func (f *textFormatter) ruleSummary() error {
+	if len(f.ruleCounts) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(f.ruleCounts))
+	for name := range f.ruleCounts {
+		names = append(names, name)
+	}
+
+	sort.Slice(names, func(i, j int) bool {
+		if f.ruleCounts[names[i]] != f.ruleCounts[names[j]] {
+			return f.ruleCounts[names[i]] > f.ruleCounts[names[j]]
+		}
+
+		return names[i] < names[j]
+	})
+
+	err := writeString(f.w, "Findings by rule (shown diagnostics):\n")
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
+		err := writef(f.w, "  %s: %d\n", name, f.ruleCounts[name])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
